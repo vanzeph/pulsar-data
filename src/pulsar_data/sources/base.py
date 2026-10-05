@@ -86,6 +86,7 @@ def run_ingestion(
     lake: Any,
     *,
     quality_column_value: str = "ok",
+    merge: bool = False,
 ) -> IngestionResult:
     """Drive one dataset through the fixed pipeline into ``lake``.
 
@@ -94,6 +95,10 @@ def run_ingestion(
     The returned frame's ``quality`` column (when the dataset carries
     one) is set to ``quality_column_value`` before writing — historical
     backfills mark rows ``backfilled``, daily increments ``ok``.
+    ``merge=True`` routes the write through
+    :meth:`pulsar_data.lake.DataLake.merge_write` (dedupe-into-existing)
+    instead of whole-partition replacement — the incremental-update
+    path; the pipeline itself is identical.
     """
     from ..quality import check_canonical
 
@@ -115,7 +120,8 @@ def run_ingestion(
     if "quality" in canonical.columns:
         canonical["quality"] = quality_column_value
 
-    partitions = lake.write(request.dataset, canonical, source=adapter.source_id)
+    writer = lake.merge_write if merge else lake.write
+    partitions = writer(request.dataset, canonical, source=adapter.source_id)
     lake.update_watermark(
         source=adapter.source_id,
         dataset=request.dataset.value,

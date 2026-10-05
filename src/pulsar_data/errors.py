@@ -9,6 +9,7 @@ __all__ = [
     "QualityViolation",
     "LakeError",
     "ConfigurationError",
+    "DataNotAvailable",
 ]
 
 
@@ -39,3 +40,12 @@ class LakeError(PulsarDataError):
 
 class ConfigurationError(PulsarDataError):
     """Invalid configuration passed to an adapter or the CLI."""
+
+
+class DataNotAvailable(PulsarDataError):
+    """A read-side request cannot be served completely from the lake.
+
+    Raised (never silently truncated) when a requested bar range has
+    unexplained missing trading days, or the requested dataset/symbol
+    is absent from the lake entirely.
+    """

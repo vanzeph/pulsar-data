@@ -1,4 +1,4 @@
-"""Command-line interface: ``pulsar-data backfill|verify|sources``.
+"""Command-line interface: ``pulsar-data backfill|verify|update|sources``.
 
 The backfill command works in two modes:
 
@@ -7,6 +7,11 @@ The backfill command works in two modes:
 * offline — ``--fixture-dir`` replays recorded raw frames through the
   exact same normalize → quality → lake pipeline, so CI and air-gapped
   hosts can exercise backfill end to end.
+
+``update`` is the watermark-driven daily incremental (日终增量) entry:
+per-symbol windows resume from each symbol's bars watermark and merge
+into existing partitions, so re-running the same ``--end`` is
+idempotent. Scheduling (cron or pulsar-app) lives outside this package.
 """
 
 from __future__ import annotations
@@ -79,6 +84,26 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--start", type=_parse_date, required=True)
     verify.add_argument("--end", type=_parse_date, required=True)
     verify.add_argument("--symbols", help="comma-separated canonical symbols (default: all)")
+
+    update = sub.add_parser(
+        "update", help="watermark-driven daily incremental update (idempotent, re-runnable)"
+    )
+    update.add_argument("--source", default="akshare", help="registered adapter id")
+    update.add_argument("--lake", default="./data/lake", help="lake root directory")
+    update.add_argument("--end", type=_parse_date, required=True, help="sync through this date")
+    update.add_argument(
+        "--initial-start",
+        type=_parse_date,
+        help="window start for symbols/datasets with no watermark yet (required on a fresh lake)",
+    )
+    target = update.add_mutually_exclusive_group()
+    target.add_argument("--symbols", help="comma-separated canonical symbols (default: lake universe)")
+    target.add_argument("--universe-file", help="file with one symbol per line")
+    update.add_argument("--fixture-dir", help="replay recorded raw frames from this directory (offline)")
+    update.add_argument("--report", help="write the JSON report here")
+    update.add_argument("--no-corporate-actions", action="store_true", help="skip corporate actions")
+    update.add_argument("--no-suspensions", action="store_true", help="skip suspension records")
+    update.add_argument("--min-interval", type=float, default=0.6, help="min seconds between upstream calls")
 
     sub.add_parser("sources", help="list registered source adapters")
     return parser
@@ -170,6 +195,40 @@ def cmd_sources(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_update(args: argparse.Namespace) -> int:
+    from .incremental import IncrementalRunner
+
+    config: dict[str, object] = {"min_interval": args.min_interval}
+    if args.fixture_dir:
+        config["fixture_dir"] = args.fixture_dir
+    adapter = get_adapter(args.source, config)
+    lake = DataLake(args.lake)
+    runner = IncrementalRunner(
+        adapter,
+        lake,
+        initial_start=args.initial_start,
+        include_corporate_actions=not args.no_corporate_actions,
+        include_suspensions=not args.no_suspensions,
+    )
+    symbols = _symbols_from_cli(args) or None
+    report = runner.run(args.end, symbols=symbols)
+
+    if args.report:
+        report.to_json(args.report)
+        print(f"report written to {args.report}")
+
+    print(
+        f"source={report.source} end={report.end} symbols={len(report.symbols)} "
+        f"bars_rows={report.bars_rows} ca_rows={report.corporate_action_rows} "
+        f"calendar_rows={report.calendar_rows}"
+    )
+    print(f"failed={len(report.failed_symbols)} skipped={len(report.skipped_symbols)}")
+    if report.failed_symbols:
+        for symbol, reason in list(report.failed_symbols.items())[:10]:
+            print(f"  FAILED {symbol}: {reason}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -179,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {
         "backfill": cmd_backfill,
         "verify": cmd_verify,
+        "update": cmd_update,
         "sources": cmd_sources,
     }
     try:

@@ -14,6 +14,7 @@ dependencies = [
     "pulsar-contracts @ git+https://github.com/vanzeph/pulsar-contracts.git@f385fbd",
     "pandas>=2.0",
     "pyarrow>=14",
+    "duckdb>=1.0",
     "requests>=2.31",
 ]
 classifiers = [

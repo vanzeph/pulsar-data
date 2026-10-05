@@ -15,12 +15,15 @@ sibling first and moved into place with ``os.replace`` — a reader
 globs either the previous complete file or the new one, never a
 half-written frame.  Whole-partition replacement (not append) makes
 backfill idempotent: re-running a partition yields byte-identical
-logical content.
+logical content.  :meth:`DataLake.merge_write` adds the incremental
+path: merge-with-existing + dedupe + the same atomic replace, so a
+partial-window incremental fetch can never truncate a partition.
 """
 
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 from datetime import date, datetime
 from pathlib import Path
@@ -32,16 +35,42 @@ from .errors import LakeError
 from .schema import Dataset, ts_to_date
 from .symbols import to_canonical_symbol
 
-__all__ = ["DataLake"]
+__all__ = ["DataLake", "MERGE_KEYS"]
+
+#: Natural (dedupe) key per dataset for :meth:`DataLake.merge_write`;
+#: incoming rows win over stored rows with the same key.
+MERGE_KEYS: dict[Dataset, tuple[str, ...]] = {
+    Dataset.BARS_1D: ("symbol", "ts"),
+    Dataset.CORPORATE_ACTIONS: ("symbol", "ex_date"),
+    Dataset.SUSPENSIONS: ("symbol", "start_date", "end_date"),
+    Dataset.INSTRUMENTS: ("symbol",),
+    Dataset.CALENDAR: ("trade_date",),
+}
 
 
 class DataLake:
-    """Read/write access to one local lake directory."""
+    """Read/write access to one local lake directory.
+
+    Concurrency semantics: readers are always safe — every partition
+    file lands through ``.tmp`` + ``os.replace``, so a reader observes
+    either the previous or the new complete frame.  Writers are
+    serialized per target file within one process (a lock map); across
+    processes the lake expects a single writer at a time (the daily
+    update job), and re-running that writer is idempotent.
+    """
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "_meta").mkdir(exist_ok=True)
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+
+    def _lock_for(self, target: Path) -> threading.Lock:
+        """Per-file writer lock (in-process serialization of writers)."""
+        key = str(target)
+        with self._locks_guard:
+            return self._locks.setdefault(key, threading.Lock())
 
     # ------------------------------------------------------------------ paths
     def partition_path(self, dataset: Dataset, keys: dict[str, str]) -> Path:
@@ -72,11 +101,70 @@ class DataLake:
         """
         written: list[str] = []
         if dataset in (Dataset.INSTRUMENTS, Dataset.CALENDAR):
-            written.append(self._write_file(dataset, {}, frame))
+            target = self.partition_path(dataset, {})
+            with self._lock_for(target):
+                written.append(self._write_file(dataset, {}, frame))
         else:
             for keys, group in self._split_partitions(dataset, frame):
-                written.append(self._write_file(dataset, keys, group))
+                target = self.partition_path(dataset, keys)
+                with self._lock_for(target):
+                    written.append(self._write_file(dataset, keys, group))
         return written
+
+    def merge_write(self, dataset: Dataset, frame: pd.DataFrame, *, source: str) -> list[str]:
+        """Merge ``frame`` into existing partitions, then atomic-replace.
+
+        The incremental-update counterpart of :meth:`write`: each touched
+        partition is read, combined with the incoming rows, deduplicated
+        on the dataset's natural key (incoming rows win), sorted, and
+        atomically replaced — so re-running the same incremental window
+        is idempotent and a partial-year fetch can never truncate a
+        partition the way a blind whole-partition replace would.  The
+        read-modify-write runs under the per-partition writer lock.
+        """
+        key = MERGE_KEYS[dataset]
+        written: list[str] = []
+        if dataset in (Dataset.INSTRUMENTS, Dataset.CALENDAR):
+            target = self.partition_path(dataset, {})
+            with self._lock_for(target):
+                merged = self._merge_frames(self._read_single(dataset), frame, key)
+                written.append(self._write_file(dataset, {}, merged))
+            return written
+        for keys, group in self._split_partitions(dataset, frame):
+            target = self.partition_path(dataset, keys)
+            with self._lock_for(target):
+                existing = self._read_partition(dataset, keys)
+                merged = self._merge_frames(existing, group, key)
+                written.append(self._write_file(dataset, keys, merged))
+        return written
+
+    @staticmethod
+    def _merge_frames(
+        existing: pd.DataFrame, incoming: pd.DataFrame, key: tuple[str, ...]
+    ) -> pd.DataFrame:
+        if existing.empty:
+            merged = incoming.copy()
+        else:
+            merged = pd.concat([existing, incoming], ignore_index=True)
+        merged = merged.drop_duplicates(subset=list(key), keep="last", ignore_index=True)
+        if "ts" in merged.columns:
+            sort_keys = [column for column in ("symbol", "ts", "ex_date", "trade_date") if column in merged.columns]
+            merged = merged.sort_values(sort_keys, kind="stable").reset_index(drop=True)
+        elif "trade_date" in merged.columns:
+            merged = merged.sort_values(["trade_date"], kind="stable").reset_index(drop=True)
+        return merged
+
+    def _read_single(self, dataset: Dataset) -> pd.DataFrame:
+        file = self.root / dataset.value / "part.parquet"
+        if not file.exists():
+            return pd.DataFrame()
+        return pd.read_parquet(file, engine="pyarrow")
+
+    def _read_partition(self, dataset: Dataset, keys: dict[str, str]) -> pd.DataFrame:
+        file = self.partition_path(dataset, keys)
+        if not file.exists():
+            return pd.DataFrame()
+        return pd.read_parquet(file, engine="pyarrow")
 
     def _split_partitions(self, dataset: Dataset, frame: pd.DataFrame):
         grouped: dict[tuple[tuple[str, str], ...], pd.DataFrame] = {}
@@ -145,6 +233,18 @@ class DataLake:
     ) -> None:
         """Upsert the per source/dataset/partition sync watermark."""
         path = self.root / "_meta" / "watermarks.parquet"
+        with self._lock_for(path):
+            self._update_watermark_locked(path, source, dataset, partitions, rows, synced_through)
+
+    def _update_watermark_locked(
+        self,
+        path: Path,
+        source: str,
+        dataset: str,
+        partitions: list[str],
+        rows: int,
+        synced_through: date,
+    ) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         fresh = pd.DataFrame(
             [
