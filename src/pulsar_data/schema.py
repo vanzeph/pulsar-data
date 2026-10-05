@@ -30,6 +30,7 @@ __all__ = [
     "INSTRUMENT_COLUMNS",
     "SUSPENSION_COLUMNS",
     "WATERMARK_COLUMNS",
+    "QUALITY_VALUES",
     "daily_ts",
     "ts_to_date",
 ]
@@ -82,6 +83,12 @@ WATERMARK_COLUMNS: Final[tuple[str, ...]] = (
     "synced_through",
     "updated_at",
 )
+
+#: Allowed values of the per-row ``quality`` mark column (可信度落地).
+#: ``ok`` — landed through the normal pipeline with no anomaly attached;
+#: ``backfilled`` — (re)written by a historical backfill or gap repair;
+#: ``suspect`` — flagged by a cross-source mismatch or other quality event.
+QUALITY_VALUES: Final[tuple[str, ...]] = ("ok", "backfilled", "suspect")
 
 
 class Dataset(str, enum.Enum):

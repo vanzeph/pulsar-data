@@ -19,6 +19,7 @@ Pulsar 数据集成包：可插拔数据源适配器框架、行情与参考数�
 - **按需复权**：湖只存原始价 + 累计因子，前复权 / 后复权在查询时按 `AdjustMode`（raw / forward / backward）派生，锚点取查询区间首/末 bar，同区间结果可复现。
 - **增量更新**：`pulsar-data update` 以水位驱动日终增量，合并去重写入（不截断已有分区），重跑幂等；与回填共用同一条采集管线。
 - **数据质量**：canonical schema 校验、OHLC 不变式、去重、相对交易日历的完整性报告（区分 `ok / not_listed / coverage_end / suspended / gap`，`gap` 为未解释缺 bar）。
+- **质量标记与缺口闭环**：每行 bar 带 `quality` 标记列（`ok / backfilled / suspect`，未知取值被质量门拒绝）；交叉校验差异事件可落地为行级 `suspect` 标记（幂等、分区原子覆盖写）；`gap` 缺口自动转化为按分区的补数任务清单，整区覆盖重取写入（重复执行逐位一致、断点续跑）；分区级质量报告 + 查询层 `quality` 参数读侧过滤。
 - **回填 CLI**：`pulsar-data backfill` 支持全市场或指定标的的历史回填，支持 `--fixture-dir` 离线回放（CI 与无网环境）。
 - **出网安全**：所有 HTTP 请求仅允许 http/https，发起前校验目标 host，拒绝 localhost / 环回 / 私有 / 保留地址；提供公共校验函数与全局 requests 守卫钩子。
 
@@ -84,6 +85,68 @@ pulsar-data update --source akshare --lake ./data/lake --end 2026-10-05
 每个标的从自身 bars 水位续拉（含水位当日重叠，可修复半日数据），合并去重写入既有
 分区；重复执行同一 `--end` 结果逐字节一致。全新数据湖需补 `--initial-start YYYY-MM-DD`
 （或先跑一次 backfill）。调度（cron 或 pulsar-app）由外部驱动，本包只保证任务可重入。
+
+### 缺口补数与质量报告
+
+```bash
+# 检测交易日历基准的未解释缺 bar 并自动补数（按分区整区覆盖，幂等、断点续跑）
+pulsar-data repair --source akshare --lake ./data/lake \
+    --start 2024-01-01 --end 2024-12-31 \
+    --report repair-report.json --task-list tasks.json
+
+# 分区级质量标记汇总（ok / backfilled / suspect 计数与日期清单）
+pulsar-data quality --lake ./data/lake --report quality-report.json
+```
+
+`repair` 把完整性报告中的 `gap` 格子按 `标的 × 年` 分区归并为补数任务（停牌、上市前、
+覆盖期末均为已解释缺席，不生成任务），每个任务重取该分区整个日历年并整区原子覆盖写入
+（行标 `backfilled`）；已完成任务的 id 持久化在 `<lake>/_meta/backfill_tasks.json`，
+重跑跳过已完成项、重试失败项（`--force` 强制全部重执行），重复执行同一任务结果逐位一致。
+
+## 质量标记与缺口闭环（库用法）
+
+交叉校验差异落地为行级 `suspect` 标记（接受 `CrossCheckReport`、事件对象或序列化
+JSON 报告中的事件字典；只改事件点名的行，分区原子覆盖重写，重复执行幂等）：
+
+```python
+from pulsar_data.quality_marks import mark_suspect
+
+report = CrossValidator(akshare_adapter, baostock_adapter).check(["SH600519"], start, end)
+result = mark_suspect(lake, report)
+result.partitions      # 被重写的分区，如 ["symbol=SH600519/year=2024"]
+result.rows_marked     # 标记为 suspect 的行数
+```
+
+缺口检测与补数任务执行：
+
+```python
+from pulsar_data.gapfill import detect_backfill_tasks, BackfillTaskExecutor
+
+tasks = detect_backfill_tasks(lake, start=date(2024, 1, 1), end=date(2024, 12, 31))
+# [BackfillTask(symbol="SH600519", year=2024, missing_days=(...)), ...]
+
+executor = BackfillTaskExecutor(adapter, lake)
+repair = executor.execute(tasks)   # 整区覆盖写；重跑幂等、断点续跑
+repair.done, repair.failed, repair.skipped
+```
+
+分区级质量报告与读侧过滤：
+
+```python
+from pulsar_data.quality_report import build_quality_report
+
+summary = build_quality_report(lake)          # 每分区 ok/backfilled/suspect 计数 + 日期清单
+summary.totals                                # {"ok": ..., "backfilled": ..., "suspect": ...}
+summary.to_json("quality-report.json")
+
+with LakeQuery("./data/lake") as query:
+    suspects = query.bars(["SH600519"], quality="suspect")        # 只要被标记行
+    trusted = query.bars(quality=("ok", "backfilled"))            # 排除 suspect
+    everything = query.bars()                                     # 不过滤（默认行为）
+```
+
+`MarketDataPort.fetch_bars` 契约签名不变、默认不过滤（标记过滤是查询层的可选参数），
+避免破坏既有读侧行为。
 
 ## 主备路由与双源交叉校验（库用法）
 
@@ -155,13 +218,16 @@ lake/
   calendar/calendar.parquet
   suspensions/symbol=SH600519/part.parquet
   _meta/watermarks.parquet                          # 每源每分区更新水位
+  _meta/backfill_tasks.json                         # 补数任务断点状态（已完成任务 id）
 ```
 
 - `bars_1d` canonical 列：`symbol, ts, open, high, low, close, volume, amount, adjust_factor, quality`。
 - 只存原始价格与复权因子；前复权 / 后复权在查询时按 `AdjustMode` 派生（复权因子由
   上游后复权价 / 原始价逐日推导，保证与源端复权口径一致）。
 - 时间戳统一 Asia/Shanghai；日线 `ts` 为该交易日 `00:00`（左闭右开区间起点）。
-- `quality` 取值 `ok / backfilled / suspect`；历史回填写入 `backfilled`。
+- `quality` 取值 `ok / backfilled / suspect`（未知取值在质量门被拒）：常规增量与参考数据写入
+  `ok`，历史回填与缺口补数写入 `backfilled`，交叉校验差异行落地 `suspect`；读侧经
+  `LakeQuery.bars(quality=...)` 按标记过滤。
 
 ## 复权口径
 

@@ -299,6 +299,66 @@ class DataLake:
         return pd.read_parquet(path, engine="pyarrow")
 
     # --------------------------------------------------------- completeness
+    #: Completeness categories every (symbol, trading day) cell falls into.
+    COMPLETENESS_CATEGORIES: tuple[str, ...] = (
+        "ok",
+        "not_listed",
+        "coverage_end",
+        "suspended",
+        "gap",
+    )
+
+    def _day_classification(
+        self,
+        *,
+        start: date,
+        end: date,
+        symbols: Iterable[str] | None = None,
+        suspension_days: dict[str, set[date]] | None = None,
+    ) -> dict[str, dict[str, list[date]]]:
+        """Day-level completeness walk: ``{symbol: {category: [days]}}``.
+
+        Single source of truth for the completeness taxonomy — both
+        :meth:`completeness` (counts) and :meth:`gap_days` (the gap
+        detector's input) are projections of this walk, so they can
+        never disagree about what a "gap" is.
+        """
+        trading_days = self.calendar_dates(start, end)
+        if not trading_days:
+            raise LakeError(
+                f"no calendar rows in [{start}, {end}]; ingest the calendar dataset first"
+            )
+        bars = self.read(Dataset.BARS_1D, symbols=symbols)
+        if bars.empty:
+            return {}
+        suspension_days = suspension_days or {}
+        out: dict[str, dict[str, list[date]]] = {}
+        bars = bars.copy()
+        bars["trade_date"] = pd.to_datetime(bars["ts"], utc=True).dt.tz_convert(
+            "Asia/Shanghai"
+        ).dt.date
+        for symbol, group in bars.groupby("symbol"):
+            canonical = to_canonical_symbol(symbol)
+            present = set(group["trade_date"])
+            first, last = min(present), max(present)
+            suspended = suspension_days.get(canonical, set())
+            buckets: dict[str, list[date]] = {
+                category: [] for category in self.COMPLETENESS_CATEGORIES
+            }
+            for day in trading_days:
+                if day in present:
+                    buckets["ok"].append(day)
+                elif day in suspended:
+                    buckets["suspended"].append(day)
+                elif day < first:
+                    buckets["not_listed"].append(day)
+                elif day > last:
+                    buckets["coverage_end"].append(day)
+                else:
+                    buckets["gap"].append(day)
+            out[canonical] = buckets
+        return out
+
     def completeness(
         self,
         *,
@@ -315,35 +375,33 @@ class DataLake:
         (after the symbol's last bar), ``suspended`` (suspension record
         covers the day), ``gap`` (unexplained missing bar).
         """
-        trading_days = self.calendar_dates(start, end)
-        if not trading_days:
-            raise LakeError(
-                f"no calendar rows in [{start}, {end}]; ingest the calendar dataset first"
-            )
-        bars = self.read(Dataset.BARS_1D, symbols=symbols)
-        if bars.empty:
-            return {}
-        suspension_days = suspension_days or {}
-        out: dict[str, dict[str, int]] = {}
-        bars["trade_date"] = pd.to_datetime(bars["ts"], utc=True).dt.tz_convert(
-            "Asia/Shanghai"
-        ).dt.date
-        for symbol, group in bars.groupby("symbol"):
-            canonical = to_canonical_symbol(symbol)
-            present = set(group["trade_date"])
-            first, last = min(present), max(present)
-            suspended = suspension_days.get(canonical, set())
-            counts = {"ok": 0, "not_listed": 0, "coverage_end": 0, "suspended": 0, "gap": 0}
-            for day in trading_days:
-                if day in present:
-                    counts["ok"] += 1
-                elif day in suspended:
-                    counts["suspended"] += 1
-                elif day < first:
-                    counts["not_listed"] += 1
-                elif day > last:
-                    counts["coverage_end"] += 1
-                else:
-                    counts["gap"] += 1
-            out[canonical] = counts
-        return out
+        classified = self._day_classification(
+            start=start, end=end, symbols=symbols, suspension_days=suspension_days
+        )
+        return {
+            symbol: {category: len(days) for category, days in buckets.items()}
+            for symbol, buckets in classified.items()
+        }
+
+    def gap_days(
+        self,
+        *,
+        start: date,
+        end: date,
+        symbols: Iterable[str] | None = None,
+        suspension_days: dict[str, set[date]] | None = None,
+    ) -> dict[str, list[date]]:
+        """Unexplained missing trading days per symbol, ascending.
+
+        The ``gap`` slice of the completeness walk (suspensions, pre-IPO
+        and after-coverage days are explained and never appear here) —
+        exactly the input the backfill-task detector consumes.
+        """
+        classified = self._day_classification(
+            start=start, end=end, symbols=symbols, suspension_days=suspension_days
+        )
+        return {
+            symbol: buckets["gap"]
+            for symbol, buckets in classified.items()
+            if buckets["gap"]
+        }

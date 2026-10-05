@@ -1,4 +1,4 @@
-"""Command-line interface: ``pulsar-data backfill|verify|update|sources``.
+"""Command-line interface: ``pulsar-data backfill|verify|update|repair|quality|sources``.
 
 The backfill command works in two modes:
 
@@ -12,6 +12,12 @@ The backfill command works in two modes:
 per-symbol windows resume from each symbol's bars watermark and merge
 into existing partitions, so re-running the same ``--end`` is
 idempotent. Scheduling (cron or pulsar-app) lives outside this package.
+
+``repair`` closes the quality loop: it detects calendar-basis gaps
+(unexplained missing bars) and executes the resulting backfill tasks —
+whole-partition overwrite writes that are idempotent and resumable.
+``quality`` prints/writes the partition-level quality-mark summary
+(ok / backfilled / suspect).
 """
 
 from __future__ import annotations
@@ -84,6 +90,30 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--start", type=_parse_date, required=True)
     verify.add_argument("--end", type=_parse_date, required=True)
     verify.add_argument("--symbols", help="comma-separated canonical symbols (default: all)")
+
+    repair = sub.add_parser(
+        "repair",
+        help="detect calendar-basis gaps and backfill them (whole-partition, idempotent)",
+    )
+    repair.add_argument("--source", default="akshare", help="registered adapter id")
+    repair.add_argument("--lake", default="./data/lake")
+    repair.add_argument("--start", type=_parse_date, required=True)
+    repair.add_argument("--end", type=_parse_date, required=True)
+    repair.add_argument("--symbols", help="comma-separated canonical symbols (default: all)")
+    repair.add_argument("--fixture-dir", help="replay recorded raw frames from this directory (offline)")
+    repair.add_argument("--report", help="write the JSON repair report here")
+    repair.add_argument("--task-list", help="write the detected backfill task list here (JSON)")
+    repair.add_argument(
+        "--force", action="store_true", help="re-execute tasks already done in a previous run"
+    )
+    repair.add_argument("--min-interval", type=float, default=0.6, help="min seconds between upstream calls")
+
+    quality = sub.add_parser(
+        "quality", help="partition-level quality report (ok / backfilled / suspect counts and day lists)"
+    )
+    quality.add_argument("--lake", default="./data/lake")
+    quality.add_argument("--symbols", help="comma-separated canonical symbols (default: all)")
+    quality.add_argument("--report", help="write the JSON quality report here")
 
     update = sub.add_parser(
         "update", help="watermark-driven daily incremental update (idempotent, re-runnable)"
@@ -195,6 +225,88 @@ def cmd_sources(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_repair(args: argparse.Namespace) -> int:
+    import json
+
+    from .gapfill import BackfillTaskExecutor, detect_backfill_tasks
+
+    config: dict[str, object] = {"min_interval": args.min_interval}
+    if args.fixture_dir:
+        config["fixture_dir"] = args.fixture_dir
+    adapter = get_adapter(args.source, config)
+    lake = DataLake(args.lake)
+    symbols = (
+        [item.strip() for item in args.symbols.split(",") if item.strip()]
+        if args.symbols
+        else None
+    )
+    tasks = detect_backfill_tasks(lake, start=args.start, end=args.end, symbols=symbols)
+    if args.task_list:
+        path = Path(args.task_list)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                [task.to_dict() for task in tasks], ensure_ascii=False, indent=2, sort_keys=True
+            ),
+            encoding="utf-8",
+        )
+        print(f"task list written to {args.task_list}")
+    print(f"detected {len(tasks)} backfill task(s)")
+    for task in tasks[:20]:
+        days = ", ".join(day.isoformat() for day in task.missing_days[:5])
+        more = "" if len(task.missing_days) <= 5 else f" (+{len(task.missing_days) - 5} more)"
+        print(f"  {task.task_id}: {len(task.missing_days)} gap day(s) [{days}{more}]")
+    if len(tasks) > 20:
+        print(f"  ... (+{len(tasks) - 20} more tasks)")
+
+    if not tasks:
+        return 0
+    executor = BackfillTaskExecutor(adapter, lake)
+    report = executor.execute(tasks, force=args.force)
+    if args.report:
+        report.to_json(args.report)
+        print(f"report written to {args.report}")
+    print(
+        f"source={report.source} tasks={len(report.results)} done={len(report.done)} "
+        f"failed={len(report.failed)} skipped={len(report.skipped)} "
+        f"rows_written={report.rows_written}"
+    )
+    for item in report.failed[:10]:
+        print(f"  FAILED {item.task.task_id}: {item.detail}")
+    if report.failed:
+        print("FAIL: gap repair left unexplained missing bars", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_quality(args: argparse.Namespace) -> int:
+    from .quality_report import build_quality_report
+
+    lake = DataLake(args.lake)
+    symbols = (
+        [item.strip() for item in args.symbols.split(",") if item.strip()]
+        if args.symbols
+        else None
+    )
+    report = build_quality_report(lake, symbols=symbols)
+    if args.report:
+        report.to_json(args.report)
+        print(f"report written to {args.report}")
+    totals = report.totals
+    print(
+        f"partitions={len(report.partitions)} rows={report.rows} "
+        f"ok={totals.get('ok', 0)} backfilled={totals.get('backfilled', 0)} "
+        f"suspect={totals.get('suspect', 0)}"
+    )
+    for item in report.partitions:
+        marks = {
+            mark: count for mark, count in item.counts.items() if mark != "ok" and count
+        }
+        suffix = f" {marks}" if marks else ""
+        print(f"  {item.partition}: rows={item.rows} ok={item.counts.get('ok', 0)}{suffix}")
+    return 0
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     from .incremental import IncrementalRunner
 
@@ -239,6 +351,8 @@ def main(argv: list[str] | None = None) -> int:
         "backfill": cmd_backfill,
         "verify": cmd_verify,
         "update": cmd_update,
+        "repair": cmd_repair,
+        "quality": cmd_quality,
         "sources": cmd_sources,
     }
     try:

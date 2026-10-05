@@ -29,7 +29,7 @@ import duckdb
 import pandas as pd
 
 from .errors import DataNotAvailable, LakeError
-from .schema import BAR_COLUMNS, Dataset
+from .schema import BAR_COLUMNS, QUALITY_VALUES, Dataset
 from .symbols import to_canonical_symbol
 
 __all__ = ["LakeQuery"]
@@ -126,8 +126,16 @@ class LakeQuery:
         symbols: Iterable[str] | None = None,
         start: date | None = None,
         end: date | None = None,
+        quality: str | Sequence[str] | None = None,
     ) -> pd.DataFrame:
-        """Raw daily bars (canonical columns) filtered by symbol and window."""
+        """Raw daily bars (canonical columns) filtered by symbol and window.
+
+        ``quality`` optionally filters rows by their quality mark
+        (``ok / backfilled / suspect``) — the read side of the lake's
+        可信度落地.  A single mark or a sequence of marks is accepted;
+        ``None`` (the default) keeps every row, preserving the
+        pre-existing behavior for callers that do not care about marks.
+        """
         self._ensure_view(Dataset.BARS_1D)
         clauses: list[str] = []
         params: list[object] = []
@@ -144,6 +152,17 @@ class LakeQuery:
         if end is not None:
             clauses.append("ts <= CAST(? AS TIMESTAMPTZ)")
             params.append(_midnight(end))
+        if quality is not None:
+            allowed = [quality] if isinstance(quality, str) else list(quality)
+            if not allowed:
+                return pd.DataFrame(columns=list(BAR_COLUMNS))
+            unknown = [mark for mark in allowed if mark not in QUALITY_VALUES]
+            if unknown:
+                raise LakeError(
+                    f"unknown quality mark(s) {unknown}; valid marks are {list(QUALITY_VALUES)}"
+                )
+            clauses.append(f"quality IN ({', '.join('?' for _ in allowed)})")
+            params.extend(allowed)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         columns = ", ".join(BAR_COLUMNS)
         frame = self.query(

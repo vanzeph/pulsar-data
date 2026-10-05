@@ -35,6 +35,7 @@ from .schema import (
     INSTRUMENT_COLUMNS,
     SUSPENSION_COLUMNS,
     Dataset,
+    QUALITY_VALUES,
 )
 from .symbols import to_canonical_symbol
 
@@ -122,6 +123,12 @@ def explain_frame_problems(dataset: Dataset, frame: pd.DataFrame) -> list[str]:
         dups = frame.duplicated(subset=["symbol", "ts"]).sum()
         if dups:
             problems.append(f"{int(dups)} duplicate (symbol, ts) rows")
+        bad_marks = ~frame["quality"].isin(QUALITY_VALUES)
+        if bad_marks.any():
+            problems.append(
+                f"quality mark must be one of {QUALITY_VALUES}; "
+                f"{int(bad_marks.sum())} rows carry other values"
+            )
         ts = pd.to_datetime(frame["ts"], utc=True).dt.tz_convert("Asia/Shanghai")
         not_midnight = (ts.dt.time != pd.Timestamp("00:00").time()).sum()
         if not_midnight:
