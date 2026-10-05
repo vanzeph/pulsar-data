@@ -59,3 +59,21 @@ jobs:
                       sys.exit(f"{path} imports {hit} outside the akshare adapter")
           print("import purity OK")
           EOF
+
+  topology-gate:
+    name: cross-repo topology gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch topology gate tool (versioned reference)
+        run: |
+          git clone --quiet https://github.com/vanzeph/pulsar-contracts.git /tmp/pulsar-contracts
+          git -C /tmp/pulsar-contracts checkout --quiet 4178b2ee27757b858922d26b7e1a532acf953e7e
+
+      - name: Topology check (pulsar-data)
+        run: python /tmp/pulsar-contracts/tools/check_topology.py --repo "$GITHUB_WORKSPACE"
