@@ -136,3 +136,33 @@ class TestPortComposition:
                 pass
 
         assert any("read-side" in str(w.message) for w in caught)
+
+
+class TestJunctionWithRealReadSide:
+    """The D3 seam, proven against the merged read-side port (offline).
+
+    D3's ``LakeMarketDataPort`` deliberately raises ``NotImplementedError``
+    from ``subscribe``; composing the mixin ahead of it in the MRO must
+    override exactly that method while leaving the read side untouched —
+    zero edits to either task's files.
+    """
+
+    def test_subscribe_overrides_the_read_side_stub(self, tmp_path):
+        from pulsar_data.port import LakeMarketDataPort
+
+        class Composed(RealtimeSubscriptionMixin, LakeMarketDataPort):
+            pass
+
+        service = Composed(tmp_path / "lake")
+        service.realtime_source = StaticSource({"SH600519": raw("SH600519", 10.0)})
+        service.realtime_poll_interval = 0.005
+        try:
+            assert isinstance(service, MarketDataPort)
+            assert service.subscribe.__func__ is not LakeMarketDataPort.subscribe
+            received: queue.Queue = queue.Queue()
+            subscription = service.subscribe(["SH600519"], received.put)
+            first = received.get(timeout=5.0)
+            assert first.symbol == "SH600519"
+            subscription.unsubscribe()
+        finally:
+            service.close_realtime()
