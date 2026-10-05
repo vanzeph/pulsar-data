@@ -162,6 +162,47 @@ with install_egress_guard():        # 守卫期间所有 requests 出网（含�
 保留（0/8、100.64/10、192.0.0/24、192.0.2/24、198.18/15、240/4、255.255.255.255）、
 组播（224/4、ff00::/8）及未指定地址；`localhost` 及其子域按名称直接拒绝。
 
+## 实时快照订阅（Paper / Live）
+
+`pulsar_data.realtime` 提供尽力而为（best-effort）的实时快照通路：采集器轮询公开免费行情接口，
+订阅分发器按 `MarketDataPort.subscribe` 契约把快照推给消费者。
+
+- **采集源**（`pulsar_data.realtime.collector`）：新浪 `hq.sinajs.cn` 批量报价为主源
+  （五档盘口 + 源端报价时钟），东方财富 `push2` 批量报价为备源（最新价 / 量额，无五档）；
+  `FailoverQuoteSource` 按声明顺序路由、记录降级事件；两者复用 D1 的出网安全校验
+  （`SafeHTTPSession`）、每源限速（`RateLimiter`）与熔断（`CircuitBreaker`）。
+- **订阅分发**（`pulsar_data.realtime.dispatcher`）：`subscribe(symbols, on_snapshot) -> Subscription`
+  返回契约的 `Subscription`（`unsubscribe()` 幂等）；每个快照带**按标的单调递增的 `seq`**
+  与 Asia/Shanghai 时间戳。**迟到与缺失从不抛异常**：缺失周期消耗其 `seq`（缺口即可见标记），
+  并通过 `subscribe_events` 发出显式 `MISSING / LATE` 标记事件（`StreamEvent`），消费者回调抛
+  异常只计数不外传。
+- **端口衔接**（`pulsar_data.realtime.mixin`）：`RealtimeSubscriptionMixin` 以组合方式把
+  `subscribe` 混入读侧 `MarketDataPort` 实现（D3 交付于 `pulsar_data.port.LakeMarketDataPort`，
+  其 `subscribe` 按分工保留 `NotImplementedError`）：
+
+```python
+from pulsar_data.port import LakeMarketDataPort                # D3 读侧
+from pulsar_data.realtime import RealtimeSubscriptionMixin
+
+class MarketDataService(RealtimeSubscriptionMixin, LakeMarketDataPort):
+    pass
+
+service = MarketDataService("./data/lake")
+subscription = service.subscribe(["SH600519", "SZ000001"], on_snapshot=lambda s: print(s.seq, s.last_price))
+...
+subscription.unsubscribe()
+
+# 需要显式观察迟到 / 缺失标记时：
+subscription = service.subscribe_events(["SH600519"], on_event=lambda e: print(e.kind, e.symbol, e.seq, e.reason))
+```
+
+测试全部离线（解析用真实端点形状的 canned 载荷）；`tests/network/` 下有一个可选的
+`@network` 实网冒烟，默认跳过，显式开启：
+
+```bash
+PULSAR_RUN_NETWORK_TESTS=1 pytest tests/network -m network
+```
+
 ## 适配器扩展
 
 新增数据源 = 新增一个适配器 + 一条注册，核心框架零改动：
