@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pulsar-data"
+version = "0.1.0"
+description = "Pulsar data integration: pluggable source adapters, normalization, and the local market-data lake."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "vanzeph" }]
+requires-python = ">=3.11"
+dependencies = [
+    "pulsar-contracts @ git+https://github.com/vanzeph/pulsar-contracts.git@f385fbd",
+    "pandas>=2.0",
+    "pyarrow>=14",
+    "requests>=2.31",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+akshare = ["akshare>=1.14"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+pulsar-data = "pulsar_data.cli:main"
+
+[project.urls]
+Repository = "https://github.com/vanzeph/pulsar-data"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pulsar_data"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

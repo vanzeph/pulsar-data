@@ -1,0 +1,31 @@
+{
+  "recorded_at": "2026-10-05T22:14:29.081028+00:00",
+  "window": [
+    "2024-01-01",
+    "2024-12-31"
+  ],
+  "symbols": [
+    "SH600519",
+    "SZ000001",
+    "SH601318",
+    "SH600036",
+    "SZ000858",
+    "SH600276",
+    "SZ300750",
+    "SZ300059",
+    "SH688981",
+    "SH688111",
+    "SZ002415",
+    "SZ002594",
+    "SH601899",
+    "SZ000651",
+    "SH603288",
+    "SZ300760",
+    "SH688012",
+    "SH601127",
+    "SZ003816",
+    "SZ301536"
+  ],
+  "universe_source": "eastmoney spot with sina fallback (same code path as production)",
+  "failed_symbols": []
+}

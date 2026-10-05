@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Test (fully offline; fixtures are committed)
+        run: pytest -q
+
+  import-purity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: Dependency direction (no pulsar-core, no strategy code)
+        run: |
+          ! grep -rn "pulsar_core\|pulsar-exec\|pulsar_exec" src/ tests/
+          python - <<'EOF'
+          import pathlib, ast, sys
+          forbidden = {"akshare"}
+          for path in pathlib.Path("src/pulsar_data").rglob("*.py"):
+              if "sources/akshare" in str(path):
+                  continue  # adapter may lazy-import its SDK
+              tree = ast.parse(path.read_text(encoding="utf-8"))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      names = [alias.name.split(".")[0] for alias in node.names]
+                  elif isinstance(node, ast.ImportFrom) and node.module:
+                      names = [node.module.split(".")[0]]
+                  else:
+                      continue
+                  hit = forbidden.intersection(names)
+                  if hit:
+                      sys.exit(f"{path} imports {hit} outside the akshare adapter")
+          print("import purity OK")
+          EOF
