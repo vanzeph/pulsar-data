@@ -3,10 +3,11 @@
 from .base import FetchRequest, IngestionResult, SourceAdapter, run_ingestion
 from .registry import AdapterFactory, get_adapter, list_adapters, register_adapter
 
-# Importing the akshare adapter registers it under "akshare".  The
-# akshare SDK itself is imported lazily inside the live client, so this
-# stays cheap (and offline-safe).
+# Importing the akshare adapter registers it under "akshare", the
+# baostock adapter under "baostock".  Both SDKs are imported lazily
+# inside their live clients, so this stays cheap (and offline-safe).
 from . import akshare as _akshare  # noqa: F401  (side effect: registration)
+from . import baostock as _baostock  # noqa: F401  (side effect: registration)
 
 __all__ = [
     "AdapterFactory",

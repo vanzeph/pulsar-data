@@ -10,6 +10,9 @@ Pulsar 数据集成包：可插拔数据源适配器框架、行情与参考数�
 
 - **SourceAdapter 内部接口**：每个数据源实现 `fetch_raw`（调上游 SDK 或 HTTP）→ `normalize`（源格式转 canonical schema），由框架统一做质量校验后写入数据湖。
 - **akshare 适配器**（首期主源）：日线（原始价 + 复权因子）、公司行为（分红送转 / 配股）、交易日历、全市场标的清单、停牌记录。
+- **baostock 适配器**（首期备源，免费无凭据）：日线（原始价 + 复权因子，`后复权/不复权` 同端点派生）、交易日历；匿名 `login/logout` 会话封装，客户端层另备分钟线与复权因子事件取数；复用出网校验、限流退避与连续失败熔断。
+- **主备路由与降级**：`SourceRouter` 按配置顺序声明 sources，主源失败（限流 / 超时 / 断流）逐调用自动降级备源，连续失败熔断（冷却后半开探测）；降级事件结构化留痕于 `<lake>/_meta/degradation_events.jsonl`。
+- **双源交叉校验**：`CrossValidator` 在双源覆盖重叠区间抽样比对收盘价 / 成交量，差异超阈值记质量事件并产出 JSON 差异报告。
 - **本地数据湖**：按 `标的 × 年` 分区的 Parquet 存储，分区级原子覆盖写（补数幂等），`_meta/watermarks.parquet` 记录每源每分区同步水位。
 - **DuckDB 查询层**：`LakeQuery` 以只读语义的内存连接 + 会话视图直查 Parquet，非 SELECT/WITH 语句一律拒绝；读取与写入并发安全（写入方同进程内按分区串行）。
 - **MarketDataPort 读侧**：`LakeMarketDataPort` 实现 `list_instruments / fetch_bars / fetch_corporate_actions / calendar`（`fetch_bars` = DuckDB 查询 + 按需复权），区间内未解释缺 bar 直接报错而非返回部分数据；`subscribe` 属实时链路（后续任务交付），显式 `NotImplementedError`。
@@ -81,6 +84,38 @@ pulsar-data update --source akshare --lake ./data/lake --end 2026-10-05
 每个标的从自身 bars 水位续拉（含水位当日重叠，可修复半日数据），合并去重写入既有
 分区；重复执行同一 `--end` 结果逐字节一致。全新数据湖需补 `--initial-start YYYY-MM-DD`
 （或先跑一次 backfill）。调度（cron 或 pulsar-app）由外部驱动，本包只保证任务可重入。
+
+## 主备路由与双源交叉校验（库用法）
+
+路由器本身实现 `SourceAdapter` 协议，可直接交给 `IncrementalRunner` / `BackfillRunner`；
+主源故障时逐调用自动降级备源，完成当日增量并留下降级事件：
+
+```python
+from pulsar_data.router import SourceRouter, DegradationLog
+
+router = SourceRouter.from_config(
+    [
+        {"id": "akshare", "min_interval": 0.6},
+        {"id": "baostock"},
+    ],
+    failure_threshold=3,          # 连续失败 3 次熔断该源
+    cooldown=300.0,               # 熔断冷却（半开探测恢复）
+    event_log=DegradationLog.for_lake("./data/lake"),
+)
+report = IncrementalRunner(router, lake).run(date(2026, 10, 5))
+# 降级事件见 ./data/lake/_meta/degradation_events.jsonl
+```
+
+双源一致性抽样（重叠区间比对收盘价 / 成交量，差异超阈值记质量事件）：
+
+```python
+from pulsar_data.crosscheck import CrossValidator
+
+report = CrossValidator(akshare_adapter, baostock_adapter,
+                        close_tolerance=0.001, volume_tolerance=0.05,
+                        sample_size=20).check(["SH600519"], start, end)
+report.to_json("crosscheck-report.json")   # quality_events 列出全部超阈差异
+```
 
 ## 读侧使用（查询层与端口）
 
@@ -222,6 +257,10 @@ def build(config: dict | None = None) -> SourceAdapter:
 
 适配器内置每源最小请求间隔与指数退避重试；连续失败熔断当次任务并逐标的记录，
 单源故障不阻塞其他标的，缺口进入下一次补数（分区级原子覆盖写保证幂等）。
+多源部署时 `SourceRouter` 在适配器熔断之外再做跨源故障切换：主源失败逐调用降级
+备源、连续失败整源跳过（冷却半开探测），每次降级写入 `_meta/degradation_events.jsonl`
+（from/to 源、数据集、标的、原因、连续失败数、是否熔断），湖内写入与水位始终归属
+实际供数源。
 
 ## 测试
 
@@ -231,10 +270,14 @@ pytest
 ```
 
 - 全部测试离线运行：实时源响应以 fixture 形式录制于 `tests/fixtures/akshare/`
-  （录制脚本 `scripts/record_fixtures.py`，manifest 记录来源与版本）。
+  （录制脚本 `scripts/record_fixtures.py`，manifest 记录来源与版本）；baostock 以
+  Mock SDK（login/logout + ResultData 游标协议的假模块）与录制假客户端驱动，
+  CI 不依赖外网。
 - 出网安全、归一化、质量校验、湖写入原子性（并发读写竞争）/ 水位 / 增量幂等重入、
   复权核对（构造分红送转样本的手工算例 + 录制茅台真实分红样本与源端口径交叉验证）、
   20 标的 × 1 年完整回填均有独立测试。
+- 主备路由：主源故障注入 → 自动降级 baostock → 完成当日增量的全流程演练、
+  熔断 / 冷却半开 / 降级事件留痕、双源交叉校验（一致通过 / 超阈差异报告）均有独立测试。
 
 ## License
 
