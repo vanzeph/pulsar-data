@@ -15,6 +15,16 @@ and corporate actions.  Properties:
   classifies every (symbol × trading day) cell against the calendar
   (``ok / not_listed / coverage_end / suspended / gap``); ``gap`` cells
   are the "unexplained missing bars" of the acceptance criteria.
+
+Minute frequencies (``5m/15m/30m/60m``) take a dedicated path:
+``freq`` selects the ``bars_<freq>`` dataset, fetches are chunked per
+calendar year (one upstream call per symbol-year keeps retries cheap
+and partitions land whole), and the post-run report classifies each
+trading day by its full session bar count (a partially filled day is
+an unexplained gap).  Day-domain reference data (instruments,
+suspensions, corporate actions) is not re-ingested on the minute
+path — the daily backfill owns it, and suspension records already in
+the lake still excuse missing minute days.
 """
 
 from __future__ import annotations
@@ -27,10 +37,11 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
+from pulsar_contracts import Freq
 
-from .errors import PulsarDataError
+from .errors import ConfigurationError, LakeError, PulsarDataError
 from .lake import DataLake
-from .schema import Dataset
+from .schema import Dataset, dataset_for_freq
 from .sources.base import FetchRequest, SourceAdapter, run_ingestion
 from .symbols import to_canonical_symbol
 
@@ -61,6 +72,11 @@ def suspension_days(lake: DataLake, symbols: Iterable[str]) -> dict[str, set[dat
     return out
 
 
+def _dataset_for(freq: Freq) -> Dataset:
+    """Lake dataset the runner writes for ``freq`` (validated by the schema)."""
+    return dataset_for_freq(freq)
+
+
 @dataclass
 class BackfillReport:
     """Summary of one backfill run plus its completeness classification."""
@@ -77,6 +93,8 @@ class BackfillReport:
     failed_symbols: dict[str, str] = field(default_factory=dict)
     skipped_symbols: list[str] = field(default_factory=list)
     completeness: dict[str, dict[str, int]] = field(default_factory=dict)
+    freq: str = Freq.DAILY.value
+    minute_missing_bars: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
     def unexplained_gaps(self) -> int:
@@ -87,8 +105,9 @@ class BackfillReport:
             "source": self.source,
             "window": [self.start.isoformat(), self.end.isoformat()],
             "symbols": self.symbols,
+            "freq": self.freq,
             "rows": {
-                "bars_1d": self.bars_rows,
+                "bars": self.bars_rows,
                 "corporate_actions": self.corporate_action_rows,
                 "calendar": self.calendar_rows,
                 "instruments": self.instrument_rows,
@@ -98,6 +117,7 @@ class BackfillReport:
             "skipped_symbols": self.skipped_symbols,
             "completeness": self.completeness,
             "unexplained_gaps": self.unexplained_gaps,
+            "minute_missing_bars": self.minute_missing_bars,
         }
 
     def to_json(self, path: str | Path) -> Path:
@@ -123,6 +143,7 @@ class BackfillRunner:
         include_instruments: bool = True,
         enrich_instruments: bool = False,
         force: bool = False,
+        freq: Freq = Freq.DAILY,
     ) -> None:
         self.adapter = adapter
         self.lake = lake
@@ -131,6 +152,8 @@ class BackfillRunner:
         self.include_instruments = include_instruments
         self.enrich_instruments = enrich_instruments
         self.force = force
+        self.freq = freq
+        self.dataset = _dataset_for(freq)
 
     # ------------------------------------------------------------------ run
     def run(
@@ -143,19 +166,35 @@ class BackfillRunner:
     ) -> BackfillReport:
         """Backfill ``symbols`` (or the whole universe when empty) over the window."""
         report = BackfillReport(
-            source=self.adapter.source_id, start=start, end=end, symbols=[]
+            source=self.adapter.source_id,
+            start=start,
+            end=end,
+            symbols=[],
+            freq=self.freq.value,
         )
         self._ingest_calendar(start, end, report)
         target_symbols = self._resolve_symbols(symbols, start, end, limit, report)
         report.symbols = list(target_symbols)
-        if self.include_instruments:
-            self._ingest_instruments(target_symbols, start, end, report)
-        if self.include_suspensions:
-            self._ingest_suspensions(target_symbols, start, end, report)
-        self._ingest_bars(target_symbols, start, end, report)
-        if self.include_corporate_actions:
-            self._ingest_corporate_actions(target_symbols, start, end, report)
-        report.completeness = self.completeness_report(target_symbols, start, end)
+        if self.freq is Freq.DAILY:
+            if self.include_instruments:
+                self._ingest_instruments(target_symbols, start, end, report)
+            if self.include_suspensions:
+                self._ingest_suspensions(target_symbols, start, end, report)
+            self._ingest_bars(target_symbols, start, end, report)
+            if self.include_corporate_actions:
+                self._ingest_corporate_actions(target_symbols, start, end, report)
+            report.completeness = self.completeness_report(target_symbols, start, end)
+            return report
+        self._ingest_minute_bars(target_symbols, start, end, report)
+        counts, missing = self.lake.minute_completeness(
+            dataset=self.dataset,
+            start=start,
+            end=end,
+            symbols=target_symbols,
+            suspension_days=suspension_days(self.lake, target_symbols),
+        )
+        report.completeness = counts
+        report.minute_missing_bars = missing
         return report
 
     # ------------------------------------------------------------- datasetes
@@ -180,13 +219,33 @@ class BackfillRunner:
         if symbols:
             resolved = [to_canonical_symbol(s) for s in symbols]
         else:
-            raw = self.adapter.fetch_raw(
-                Dataset.INSTRUMENTS, FetchRequest(Dataset.INSTRUMENTS, start, end)
-            )
-            canonical = self.adapter.normalize(
-                Dataset.INSTRUMENTS, raw, FetchRequest(Dataset.INSTRUMENTS, start, end)
-            )
-            resolved = sorted(canonical["symbol"].tolist())
+            try:
+                raw = self.adapter.fetch_raw(
+                    Dataset.INSTRUMENTS, FetchRequest(Dataset.INSTRUMENTS, start, end)
+                )
+                canonical = self.adapter.normalize(
+                    Dataset.INSTRUMENTS, raw, FetchRequest(Dataset.INSTRUMENTS, start, end)
+                )
+                resolved = sorted(canonical["symbol"].tolist())
+            except PulsarDataError:
+                # full-market entry on a source without universe discovery
+                # (baostock): fall back to the instruments the daily backfill
+                # already landed — the lake is the state.
+                try:
+                    instruments = self.lake.read(Dataset.INSTRUMENTS)
+                except LakeError:
+                    instruments = pd.DataFrame()
+                if instruments.empty:
+                    raise ConfigurationError(
+                        "cannot resolve the full market: the source serves no universe "
+                        "dataset and the lake holds no instruments snapshot yet — run the "
+                        "daily backfill once or pass --symbols/--universe-file"
+                    ) from None
+                resolved = sorted(to_canonical_symbol(s) for s in instruments["symbol"])
+                logger.info(
+                    "universe resolved from the lake's instruments snapshot: %d symbols",
+                    len(resolved),
+                )
         if limit is not None:
             resolved = resolved[:limit]
         return resolved
@@ -273,6 +332,40 @@ class BackfillRunner:
             if index % 25 == 0:
                 logger.info("bars progress: %d/%d", index, len(symbols))
 
+    def _ingest_minute_bars(
+        self, symbols: Sequence[str], start: date, end: date, report: BackfillReport
+    ) -> None:
+        """Per-symbol, per-calendar-year minute fetches into ``bars_<freq>``.
+
+        One upstream call per symbol-year keeps single-call responses
+        bounded, retries cheap and partitions whole; a year with no
+        upstream coverage simply lands zero rows (the completeness walk
+        files it under not_listed/coverage_end, never as a gap).
+        """
+        dataset = self.dataset
+        years = range(start.year, end.year + 1)
+        for index, symbol in enumerate(symbols, start=1):
+            if not self.force and self._bars_synced(symbol, start, end):
+                report.skipped_symbols.append(symbol)
+                continue
+            for year in years:
+                window_start = max(start, date(year, 1, 1))
+                window_end = min(end, date(year, 12, 31))
+                if window_start > window_end:
+                    continue
+                request = FetchRequest(dataset, window_start, window_end, symbol=symbol)
+                try:
+                    result = run_ingestion(
+                        self.adapter, request, self.lake, quality_column_value="backfilled"
+                    )
+                    report.bars_rows += result.rows
+                except PulsarDataError as exc:
+                    report.failed_symbols[symbol] = f"{dataset.value}: {str(exc)[:280]}"
+                    logger.warning("minute backfill failed for %s (%d): %s", symbol, year, exc)
+                    break
+            if index % 5 == 0:
+                logger.info("minute bars progress (%s): %d/%d", dataset.value, index, len(symbols))
+
     def _ingest_corporate_actions(
         self, symbols: Sequence[str], start: date, end: date, report: BackfillReport
     ) -> None:
@@ -295,7 +388,7 @@ class BackfillRunner:
             return False
         rows = marks[
             (marks["source"] == self.adapter.source_id)
-            & (marks["dataset"] == Dataset.BARS_1D.value)
+            & (marks["dataset"] == self.dataset.value)
             & (marks["partition"].str.startswith(f"symbol={symbol}/"))
         ]
         for _, row in rows.iterrows():

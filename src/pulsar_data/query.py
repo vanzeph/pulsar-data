@@ -6,6 +6,15 @@ DuckDB connection, points it at the lake's Parquet files through
 session-local views, and serves every read from SQL — the pandas
 row-at-a-time :meth:`DataLake.read` stays a maintenance path only.
 
+Minute frequencies read their own ``bars_<freq>`` partition family
+directly; when the requested granularity was never backfilled but a
+finer minute family was, :meth:`LakeQuery.bars` downsamples on demand
+(按需降采样): buckets are formed per symbol on the left-closed session
+grid — 09:30-anchored mornings, 13:00-anchored afternoons, lunch break
+excluded — with ``open=first, high=max, low=min, close=last,
+volume/amount=sum, adjust_factor=last``.  A ``quality`` filter applied
+together with downsampling filters the *source* rows before bucketing.
+
 Read-only semantics are enforced twice:
 
 * the connection is in-memory and no write statement is ever issued;
@@ -21,15 +30,24 @@ into a query result.
 from __future__ import annotations
 
 import threading
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import duckdb
 import pandas as pd
+from pulsar_contracts import Freq
 
 from .errors import DataNotAvailable, LakeError
-from .schema import BAR_COLUMNS, QUALITY_VALUES, Dataset
+from .schema import (
+    BAR_COLUMNS,
+    DATASET_MINUTES,
+    MINUTE_DATASETS,
+    QUALITY_VALUES,
+    SESSION_STARTS,
+    Dataset,
+    dataset_for_freq,
+)
 from .symbols import to_canonical_symbol
 
 __all__ = ["LakeQuery"]
@@ -127,8 +145,16 @@ class LakeQuery:
         start: date | None = None,
         end: date | None = None,
         quality: str | Sequence[str] | None = None,
+        freq: Freq = Freq.DAILY,
     ) -> pd.DataFrame:
-        """Raw daily bars (canonical columns) filtered by symbol and window.
+        """Raw bars (canonical columns) filtered by symbol and window, per ``freq``.
+
+        ``freq`` selects the partition family: ``1d`` reads ``bars_1d``
+        (``ts <= end`` at midnight, the left-closed daily convention);
+        a minute frequency reads its ``bars_<freq>`` family through the
+        whole end day (``ts < end + 1 day``), and when that family was
+        never backfilled but a finer one exists, the finer family is
+        downsampled on demand (see the module docstring).
 
         ``quality`` optionally filters rows by their quality mark
         (``ok / backfilled / suspect``) — the read side of the lake's
@@ -136,7 +162,16 @@ class LakeQuery:
         ``None`` (the default) keeps every row, preserving the
         pre-existing behavior for callers that do not care about marks.
         """
-        self._ensure_view(Dataset.BARS_1D)
+        dataset = dataset_for_freq(freq)
+        if dataset is Dataset.BARS_1D:
+            # daily bars live at midnight; the end day's bar equals the bound
+            end_operator = "<="
+            window_end = None if end is None else _midnight(end)
+        else:
+            # minute bars span the whole end day, up to (exclusive) next midnight
+            end_operator = "<"
+            window_end = None if end is None else _midnight(end + timedelta(days=1))
+        source, source_dataset = self._bars_source(dataset)
         clauses: list[str] = []
         params: list[object] = []
         wanted: list[str] | None = None
@@ -149,9 +184,9 @@ class LakeQuery:
         if start is not None:
             clauses.append("ts >= CAST(? AS TIMESTAMPTZ)")
             params.append(_midnight(start))
-        if end is not None:
-            clauses.append("ts <= CAST(? AS TIMESTAMPTZ)")
-            params.append(_midnight(end))
+        if window_end is not None:
+            clauses.append(f"ts {end_operator} CAST(? AS TIMESTAMPTZ)")
+            params.append(window_end)
         if quality is not None:
             allowed = [quality] if isinstance(quality, str) else list(quality)
             if not allowed:
@@ -166,10 +201,34 @@ class LakeQuery:
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         columns = ", ".join(BAR_COLUMNS)
         frame = self.query(
-            f"SELECT {columns} FROM bars_1d{where} ORDER BY symbol, ts", params or None
+            f"SELECT {columns} FROM {source}{where} ORDER BY symbol, ts", params or None
         )
         frame["ts"] = pd.to_datetime(frame["ts"], utc=True).dt.tz_convert("Asia/Shanghai")
-        return frame.reset_index(drop=True)
+        frame = frame.reset_index(drop=True)
+        if source_dataset is dataset:
+            return frame
+        return _downsample(
+            frame, DATASET_MINUTES[source_dataset], DATASET_MINUTES[dataset]
+        )
+
+    def _bars_source(self, dataset: Dataset) -> tuple[str, Dataset]:
+        """Registered view serving ``dataset``: itself, or a finer family.
+
+        Raises :class:`DataNotAvailable` when neither the requested
+        family nor any finer minute family is present.
+        """
+        if self.has(dataset):
+            self._ensure_view(dataset)
+            return dataset.value, dataset
+        if dataset in DATASET_MINUTES:
+            for finer in MINUTE_DATASETS:  # thinnest first
+                if DATASET_MINUTES[finer] < DATASET_MINUTES[dataset] and self.has(finer):
+                    self._ensure_view(finer)
+                    return finer.value, finer
+        raise DataNotAvailable(
+            f"{dataset.value} is not present in lake {self.root} (nor is any finer "
+            "minute family to downsample from); ingest it before querying"
+        )
 
     def corporate_actions(self, symbols: Iterable[str] | None = None) -> pd.DataFrame:
         """Corporate-action rows, optionally restricted to ``symbols``."""
@@ -211,3 +270,58 @@ class LakeQuery:
 def _midnight(day: date) -> str:
     """ISO form of ``day`` at Asia/Shanghai midnight for TIMESTAMPTZ casts."""
     return f"{day.isoformat()}T00:00:00+08:00"
+
+
+def _bucket_start(ts: pd.Timestamp, minutes: int) -> pd.Timestamp:
+    """Left-closed bucket start of ``ts`` on the session-relative grid.
+
+    Sessions are anchored at 09:30 (morning) and 13:00 (afternoon); the
+    bucket of a bar starts at ``session_start + floor(offset / minutes) *
+    minutes``.  Timestamps outside both sessions (should not exist past
+    the quality gate) bucket relative to the morning anchor.
+    """
+    local = ts.tz_convert("Asia/Shanghai")
+    minute_of_day = local.hour * 60 + local.minute
+    morning, afternoon = SESSION_STARTS
+    anchor = afternoon if minute_of_day >= afternoon else morning
+    offset = max(minute_of_day - anchor, 0)
+    return local.normalize() + pd.Timedelta(minutes=anchor + (offset // minutes) * minutes)
+
+
+def _downsample(frame: pd.DataFrame, source_minutes: int, target_minutes: int) -> pd.DataFrame:
+    """Aggregate a finer-minute frame onto the coarser session grid.
+
+    OHLC becomes first/max/min/last, ``volume``/``amount`` sum, and the
+    bucket keeps the **last** ``adjust_factor`` (the cumulative factor
+    is constant within a trading day by construction).  Rows arrive
+    already filtered by symbol/window/quality from the SQL layer.
+    """
+    if target_minutes % source_minutes != 0:
+        raise LakeError(
+            f"cannot downsample {source_minutes}m partitions to {target_minutes}m "
+            "(source does not divide the target)"
+        )
+    if frame.empty:
+        return frame
+    stamped = frame.copy()
+    stamped["bucket"] = stamped["ts"].map(lambda ts: _bucket_start(ts, target_minutes))
+    grouped = stamped.sort_values(["symbol", "ts"], kind="stable").groupby(
+        ["symbol", "bucket"], sort=False
+    )
+    merged = pd.DataFrame(
+        {
+            "open": grouped["open"].first(),
+            "high": grouped["high"].max(),
+            "low": grouped["low"].min(),
+            "close": grouped["close"].last(),
+            "volume": grouped["volume"].sum(),
+            "amount": grouped["amount"].sum(),
+            "adjust_factor": grouped["adjust_factor"].last(),
+            "quality": grouped["quality"].agg(
+                lambda marks: "suspect" if (marks == "suspect").any()
+                else ("backfilled" if (marks == "backfilled").any() else "ok")
+            ),
+        }
+    ).reset_index()
+    merged = merged.rename(columns={"bucket": "ts"})
+    return merged.sort_values(["symbol", "ts"]).reset_index(drop=True)[list(BAR_COLUMNS)]

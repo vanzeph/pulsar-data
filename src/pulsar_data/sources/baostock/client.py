@@ -15,9 +15,11 @@ login is anonymous and this module never reads secrets.
 
 The client also exposes minute-frequency bars (``frequency="5" | "15" |
 "30" | "60"``) and raw adjustment-factor events for callers that need
-them; the adapter currently normalizes the daily frequency into the
-canonical ``bars_1d`` schema (minute bars land with the ``bars_1min``
-dataset, 二期).
+them; the adapter normalizes the daily frequency into the canonical
+``bars_1d`` schema and the minute frequencies into the per-granularity
+``bars_5min`` / ``bars_15min`` / ``bars_30min`` / ``bars_60min``
+datasets (minute bars' cumulative factor comes from the
+adjust-factor event walk, not a second hfq minute fetch).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import date
+from pathlib import Path
 from typing import Callable, Protocol
 
 import pandas as pd
@@ -39,6 +42,7 @@ __all__ = [
     "BaostockClient",
     "BaostockSession",
     "LiveBaostockClient",
+    "FixtureBaostockClient",
     "to_baostock_code",
     "from_baostock_code",
 ]
@@ -355,3 +359,80 @@ def _query_trade_dates(session: BaostockSession, start: date, end: date) -> obje
     return module.query_trade_dates(
         start_date=start.strftime("%Y-%m-%d"), end_date=end.strftime("%Y-%m-%d")
     )
+
+
+class FixtureBaostockClient:
+    """Replay recorded raw frames from a fixture directory (fully offline).
+
+    Layout (files keyed by canonical symbol, mirroring the akshare
+    fixture conventions so CI can exercise the minute pipeline end to
+    end without the socket SDK)::
+
+        <fixture_dir>/
+          calendar.csv                      # calendar_date,is_trading_day
+          minute/SH600519.5.csv             # date,time,code,open,...,adjustflag
+          adjust_factors/SH600519.csv       # code,dividOperateDate,adjustFactor,...
+
+    Missing files replay as empty frames (a symbol-year outside the
+    recorded sample simply lands no rows), and every frame is windowed
+    to the request exactly like the live client's server-side window.
+    """
+
+    def __init__(self, fixture_dir: str | Path) -> None:
+        self.root = Path(fixture_dir)
+        if not self.root.is_dir():
+            raise ConfigurationError(f"fixture directory not found: {self.root}")
+
+    @staticmethod
+    def _canonical(code: str) -> str:
+        return from_baostock_code(code)
+
+    def _read(self, relative: str) -> pd.DataFrame:
+        path = self.root / relative
+        if not path.exists():
+            logger.debug("fixture missing %s -> empty frame", relative)
+            return pd.DataFrame()
+        try:
+            return pd.read_csv(path, dtype={"code": str, "time": str})
+        except pd.errors.EmptyDataError:
+            return pd.DataFrame()
+
+    @staticmethod
+    def _window(frame: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+        if frame.empty or "date" not in frame.columns:
+            return frame
+        dates = pd.to_datetime(frame["date"], errors="coerce")
+        keep = dates.dt.date.between(start, end) & dates.notna()
+        return frame.loc[keep]
+
+    def daily_bars_pair(self, code: str, start: date, end: date) -> tuple[pd.DataFrame, pd.DataFrame]:
+        symbol = self._canonical(code)
+        raw = self._window(self._read(f"bars/{symbol}.raw.csv"), start, end)
+        hfq = self._window(self._read(f"bars/{symbol}.hfq.csv"), start, end)
+        return raw, hfq
+
+    def minute_bars(self, code: str, start: date, end: date, frequency: str = "5") -> pd.DataFrame:
+        if frequency not in {"5", "15", "30", "60"}:
+            raise ConfigurationError(f"unsupported minute frequency {frequency!r}")
+        symbol = self._canonical(code)
+        frame = self._read(f"minute/{symbol}.{frequency}.csv")
+        return self._window(frame, start, end)
+
+    def adjust_factor_events(self, code: str, start: date, end: date) -> pd.DataFrame:
+        frame = self._read(f"adjust_factors/{self._canonical(code)}.csv")
+        if frame.empty or "dividOperateDate" not in frame.columns:
+            return frame
+        dates = pd.to_datetime(frame["dividOperateDate"], errors="coerce")
+        keep = dates.dt.date.between(start, end) & dates.notna()
+        return frame.loc[keep]
+
+    def trade_dates(self, start: date, end: date) -> pd.DataFrame:
+        frame = self._read("calendar.csv")
+        if frame.empty or "calendar_date" not in frame.columns:
+            return frame
+        dates = pd.to_datetime(frame["calendar_date"], errors="coerce")
+        keep = dates.dt.date.between(start, end) & dates.notna()
+        return frame.loc[keep]
+
+    def close(self) -> None:
+        pass

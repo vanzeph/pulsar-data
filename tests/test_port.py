@@ -153,8 +153,11 @@ def test_fetch_bars_empty_symbols_returns_canonical_empty(port: LakeMarketDataPo
     assert list(frame.columns) == list(BAR_COLUMNS)
 
 
-def test_fetch_bars_minute_freq_not_implemented(port: LakeMarketDataPort):
-    with pytest.raises(NotImplementedError, match="minute"):
+def test_fetch_bars_one_minute_freq_has_no_source(port: LakeMarketDataPort):
+    """1m stays reserved (no source serves it); 5/15/30/60m are lake datasets."""
+    from pulsar_data.errors import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="no lake dataset serves freq"):
         port.fetch_bars(["SH600519"], date(2024, 1, 1), date(2024, 1, 31), Freq.MINUTE, AdjustMode.RAW)
 
 

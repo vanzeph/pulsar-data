@@ -13,6 +13,14 @@ per-symbol windows resume from each symbol's bars watermark and merge
 into existing partitions, so re-running the same ``--end`` is
 idempotent. Scheduling (cron or pulsar-app) lives outside this package.
 
+``backfill --freq 5m|15m|30m|60m`` is the minute-granular entry: bars
+land in their ``bars_<freq>`` partition family (fetched per
+symbol-year, calendar still ingested from the same source), the
+universe comes from ``--symbols`` / ``--universe-file`` / ``--all``
+(the last falls back to the lake's instruments snapshot for sources
+without universe discovery), and the post-run report classifies each
+trading day by its full session bar count. Minute sources: baostock.
+
 ``repair`` closes the quality loop: it detects calendar-basis gaps
 (unexplained missing bars) and executes the resulting backfill tasks —
 whole-partition overwrite writes that are idempotent and resumable.
@@ -28,12 +36,24 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from pulsar_contracts import Freq
+
 from .backfill import BackfillRunner, suspension_days
 from .errors import PulsarDataError
 from .lake import DataLake
 from .sources import get_adapter, list_adapters
 
 logger = logging.getLogger("pulsar_data.cli")
+
+
+def _parse_freq(value: str) -> Freq:
+    try:
+        return Freq(value)
+    except ValueError:
+        choices = ", ".join(freq.value for freq in Freq)
+        raise argparse.ArgumentTypeError(
+            f"unknown freq {value!r}; choose one of: {choices}"
+        ) from None
 
 
 def _parse_date(value: str) -> date:
@@ -63,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill.add_argument("--limit", type=int, help="cap symbol count (sampling)")
     backfill.add_argument(
+        "--freq",
+        type=_parse_freq,
+        default=Freq.DAILY,
+        help="bar granularity: 1d (default) or 5m/15m/30m/60m minute families",
+    )
+    backfill.add_argument(
         "--fixture-dir", help="replay recorded raw frames from this directory (offline)"
     )
     backfill.add_argument("--report", help="write the JSON quality report here")
@@ -90,6 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--start", type=_parse_date, required=True)
     verify.add_argument("--end", type=_parse_date, required=True)
     verify.add_argument("--symbols", help="comma-separated canonical symbols (default: all)")
+    verify.add_argument(
+        "--freq",
+        type=_parse_freq,
+        default=Freq.DAILY,
+        help="verify the daily bars (1d, default) or a minute family (5m/15m/30m/60m)",
+    )
 
     repair = sub.add_parser(
         "repair",
@@ -161,6 +193,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         include_suspensions=not args.no_suspensions,
         enrich_instruments=args.enrich_instruments,
         force=args.force,
+        freq=args.freq,
     )
     symbols = _symbols_from_cli(args)
     report = runner.run(symbols, args.start, args.end, limit=args.limit)
@@ -171,7 +204,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
 
     total_cells = sum(sum(counts.values()) for counts in report.completeness.values())
     print(
-        f"source={report.source} window=[{report.start}, {report.end}] "
+        f"source={report.source} freq={report.freq} window=[{report.start}, {report.end}] "
         f"symbols={len(report.symbols)} bars_rows={report.bars_rows} "
         f"ca_rows={report.corporate_action_rows} calendar_rows={report.calendar_rows} "
         f"suspension_rows={report.suspension_rows}"
@@ -194,25 +227,41 @@ def cmd_backfill(args: argparse.Namespace) -> int:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
+    from .schema import dataset_for_freq
+
     lake = DataLake(args.lake)
     symbols = (
         [item.strip() for item in args.symbols.split(",") if item.strip()]
         if args.symbols
         else None
     )
-    completeness = lake.completeness(
-        start=args.start,
-        end=args.end,
-        symbols=symbols,
-        suspension_days=suspension_days(lake, symbols or []),
-    )
+    if args.freq is Freq.DAILY:
+        completeness = lake.completeness(
+            start=args.start,
+            end=args.end,
+            symbols=symbols,
+            suspension_days=suspension_days(lake, symbols or []),
+        )
+        missing_bars: dict[str, dict[str, int]] = {}
+    else:
+        completeness, missing_bars = lake.minute_completeness(
+            dataset=dataset_for_freq(args.freq),
+            start=args.start,
+            end=args.end,
+            symbols=symbols,
+            suspension_days=suspension_days(lake, symbols or []),
+        )
     gaps = 0
     for symbol, counts in sorted(completeness.items()):
         gaps += counts.get("gap", 0)
         flags = {key: value for key, value in counts.items() if key != "ok" and value}
         suffix = f" {flags}" if flags else ""
-        print(f"  {symbol}: ok={counts.get('ok', 0)}{suffix}")
-    print(f"symbols={len(completeness)} unexplained_gaps={gaps}")
+        detail = ""
+        if symbol in missing_bars:
+            first = next(iter(missing_bars[symbol].items()))
+            detail = f" e.g. {first[0]} missing {first[1]} bars"
+        print(f"  {symbol}: ok={counts.get('ok', 0)}{suffix}{detail}")
+    print(f"freq={args.freq.value} symbols={len(completeness)} unexplained_gaps={gaps}")
     if gaps:
         print("FAIL: unexplained missing bars remain", file=sys.stderr)
         return 1

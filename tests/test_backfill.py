@@ -189,7 +189,8 @@ def test_offline_cli_backfill_end_to_end(fixture_dir, tmp_path, capsys):
     assert "unexplained_gaps=0" in out
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["unexplained_gaps"] == 0
-    assert payload["rows"]["bars_1d"] > 600
+    assert payload["rows"]["bars"] > 600
+    assert payload["freq"] == "1d"
 
 
 def test_verify_cli_detects_gap_after_tampering(fixture_dir, tmp_path, capsys):

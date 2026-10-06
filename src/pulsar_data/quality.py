@@ -12,6 +12,11 @@ Checks per dataset:
   >= 0; ``adjust_factor > 0``; no duplicate ``(symbol, ts)``; ``ts``
   must be midnight Asia/Shanghai (left-closed daily convention);
   optionally rows must fall inside the requested window (warn-level).
+* **bars_5min / bars_15min / bars_30min / bars_60min** — the same bar
+  invariants, with ``ts`` validated against the left-closed intraday
+  session grid instead of midnight: every bar must start inside a
+  continuous session (09:30-11:30 / 13:00-15:00) on the frequency's
+  grid anchored at the session start.
 * **calendar** — unique, weekday, ascending trade dates.
 * **corporate_actions** — valid ex-dates; at least one non-zero
   component; rights issues must carry a price.
@@ -30,12 +35,16 @@ import pandas as pd
 from .errors import QualityViolation
 from .schema import (
     BAR_COLUMNS,
+    BAR_DATASETS,
     CALENDAR_COLUMNS,
     CORPORATE_ACTION_COLUMNS,
+    DATASET_MINUTES,
     INSTRUMENT_COLUMNS,
+    MINUTE_DATASETS,
     SUSPENSION_COLUMNS,
     Dataset,
     QUALITY_VALUES,
+    SESSION_STARTS,
 )
 from .symbols import to_canonical_symbol
 
@@ -46,6 +55,7 @@ __all__ = ["check_canonical", "explain_frame_problems"]
 
 _COLUMN_SETS: dict[Dataset, tuple[str, ...]] = {
     Dataset.BARS_1D: BAR_COLUMNS,
+    **{dataset: BAR_COLUMNS for dataset in MINUTE_DATASETS},
     Dataset.CALENDAR: CALENDAR_COLUMNS,
     Dataset.CORPORATE_ACTIONS: CORPORATE_ACTION_COLUMNS,
     Dataset.INSTRUMENTS: INSTRUMENT_COLUMNS,
@@ -55,6 +65,7 @@ _COLUMN_SETS: dict[Dataset, tuple[str, ...]] = {
 #: Columns that are legitimately optional (unknown from a given source).
 _NULLABLE: dict[Dataset, frozenset[str]] = {
     Dataset.BARS_1D: frozenset(),
+    **{dataset: frozenset() for dataset in MINUTE_DATASETS},
     Dataset.CALENDAR: frozenset(),
     Dataset.CORPORATE_ACTIONS: frozenset({"rights_issue_price", "description"}),
     Dataset.INSTRUMENTS: frozenset({"list_date", "delist_date", "shares_outstanding"}),
@@ -65,6 +76,31 @@ _NULLABLE: dict[Dataset, frozenset[str]] = {
 def _fail(dataset: Dataset, problems: list[str]) -> None:
     detail = "; ".join(problems[:12]) + (" ..." if len(problems) > 12 else "")
     raise QualityViolation(f"quality gate failed for {dataset.value}: {detail}")
+
+
+def _off_session_grid(ts: pd.Series, minutes: int) -> pd.Series:
+    """Boolean mask of timestamps outside the freq's session grid.
+
+    A bar is on-grid when it starts inside a continuous session
+    (``[09:30, 11:30)`` or ``[13:00, 15:00)``) and its offset from that
+    session's start is a multiple of ``minutes`` — the labeling the
+    baostock minute series exhibits once end-times are shifted to the
+    left-closed convention (09:30-anchored mornings, 13:00-anchored
+    afternoons, lunch break excluded).
+    """
+    local = ts.dt.tz_convert("Asia/Shanghai")
+    minute_of_day = local.dt.hour * 60 + local.dt.minute
+    morning, afternoon = SESSION_STARTS
+    in_morning = (minute_of_day >= morning) & (minute_of_day < morning + 120)
+    in_afternoon = (minute_of_day >= afternoon) & (minute_of_day < afternoon + 120)
+    offset = pd.Series(
+        pd.concat(
+            [minute_of_day[in_morning] - morning, minute_of_day[in_afternoon] - afternoon]
+        ).reindex(minute_of_day.index),
+        dtype="float64",
+    )
+    on_grid = (offset.notna()) & ((offset % minutes) == 0)
+    return ~on_grid
 
 
 def _column_problems(dataset: Dataset, frame: pd.DataFrame) -> list[str]:
@@ -105,7 +141,7 @@ def explain_frame_problems(dataset: Dataset, frame: pd.DataFrame) -> list[str]:
     required = [column for column in frame.columns if column not in nullable]
     problems: list[str] = list(_finite(frame, required))
 
-    if dataset is Dataset.BARS_1D:
+    if dataset in BAR_DATASETS:
         for column in ("open", "high", "low", "close"):
             bad = (frame[column] <= 0).sum()
             if bad:
@@ -130,11 +166,19 @@ def explain_frame_problems(dataset: Dataset, frame: pd.DataFrame) -> list[str]:
                 f"{int(bad_marks.sum())} rows carry other values"
             )
         ts = pd.to_datetime(frame["ts"], utc=True).dt.tz_convert("Asia/Shanghai")
-        not_midnight = (ts.dt.time != pd.Timestamp("00:00").time()).sum()
-        if not_midnight:
-            problems.append(
-                f"{int(not_midnight)} daily bars not at 00:00 Asia/Shanghai (left-closed convention)"
-            )
+        if dataset is Dataset.BARS_1D:
+            not_midnight = (ts.dt.time != pd.Timestamp("00:00").time()).sum()
+            if not_midnight:
+                problems.append(
+                    f"{int(not_midnight)} daily bars not at 00:00 Asia/Shanghai (left-closed convention)"
+                )
+        else:
+            off_grid = _off_session_grid(ts, DATASET_MINUTES[dataset])
+            if bool(off_grid.any()):
+                problems.append(
+                    f"{int(off_grid.sum())} minute bars off the {DATASET_MINUTES[dataset]}-minute "
+                    "session grid (left-closed convention: 09:30/13:00 anchored)"
+                )
         try:
             frame["symbol"].map(to_canonical_symbol)
         except Exception as exc:  # noqa: BLE001

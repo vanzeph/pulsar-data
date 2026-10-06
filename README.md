@@ -10,17 +10,18 @@ Pulsar 数据集成包：可插拔数据源适配器框架、行情与参考数�
 
 - **SourceAdapter 内部接口**：每个数据源实现 `fetch_raw`（调上游 SDK 或 HTTP）→ `normalize`（源格式转 canonical schema），由框架统一做质量校验后写入数据湖。
 - **akshare 适配器**（首期主源）：日线（原始价 + 复权因子）、公司行为（分红送转 / 配股）、交易日历、全市场标的清单、停牌记录。
-- **baostock 适配器**（首期备源，免费无凭据）：日线（原始价 + 复权因子，`后复权/不复权` 同端点派生）、交易日历；匿名 `login/logout` 会话封装，客户端层另备分钟线与复权因子事件取数；复用出网校验、限流退避与连续失败熔断。
+- **baostock 适配器**（免费无凭据；日线备源 / **分钟级主源**）：日线（原始价 + 复权因子，`后复权/不复权` 同端点派生）、交易日历、**5/15/30/60 分钟线**（原始价 + 全历史复权因子事件 as-of 合并的累计因子）；匿名 `login/logout` 会话封装；复用出网校验、限流退避与连续失败熔断。
 - **主备路由与降级**：`SourceRouter` 按配置顺序声明 sources，主源失败（限流 / 超时 / 断流）逐调用自动降级备源，连续失败熔断（冷却后半开探测）；降级事件结构化留痕于 `<lake>/_meta/degradation_events.jsonl`。
 - **双源交叉校验**：`CrossValidator` 在双源覆盖重叠区间抽样比对收盘价 / 成交量，差异超阈值记质量事件并产出 JSON 差异报告。
-- **本地数据湖**：按 `标的 × 年` 分区的 Parquet 存储，分区级原子覆盖写（补数幂等），`_meta/watermarks.parquet` 记录每源每分区同步水位。
-- **DuckDB 查询层**：`LakeQuery` 以只读语义的内存连接 + 会话视图直查 Parquet，非 SELECT/WITH 语句一律拒绝；读取与写入并发安全（写入方同进程内按分区串行）。
-- **MarketDataPort 读侧**：`LakeMarketDataPort` 实现 `list_instruments / fetch_bars / fetch_corporate_actions / calendar`（`fetch_bars` = DuckDB 查询 + 按需复权），区间内未解释缺 bar 直接报错而非返回部分数据；`subscribe` 属实时链路（后续任务交付），显式 `NotImplementedError`。
+- **本地数据湖**：按 `标的 × 年` 分区的 Parquet 存储（日线 `bars_1d` 与分钟族 `bars_5min / bars_15min / bars_30min / bars_60min` 同构分区），分区级原子覆盖写（补数幂等），`_meta/watermarks.parquet` 记录每源每分区同步水位。
+- **分钟级数据**：baostock 分钟线入湖——上游按"区间结束时刻"标记的 bar 归一化为左闭区间起点；质量门校验时段网格（09:30/13:00 锚定、午休排除）；完整性按"每交易日满 48/16/8/4 根"判定，未解释缺根即 gap；实测上游分钟覆盖自 **2020-06** 起（更早年份无数据，属已解释缺席）。
+- **DuckDB 查询层**：`LakeQuery` 以只读语义的内存连接 + 会话视图直查 Parquet，非 SELECT/WITH 语句一律拒绝；读取与写入并发安全（写入方同进程内按分区串行）；分钟族按 `freq` 路由，缺族时自动从更细粒度**按需降采样**（OHLC 首/高/低/末，量额求和，因子取末）。
+- **MarketDataPort 读侧**：`LakeMarketDataPort` 实现 `list_instruments / fetch_bars / fetch_corporate_actions / calendar`（`fetch_bars` = DuckDB 查询 + 按需复权，支持 `1d` 与 `5m/15m/30m/60m`），区间内未解释缺 bar（分钟级含未满时段）直接报错而非返回部分数据；`subscribe` 属实时链路（后续任务交付），显式 `NotImplementedError`。
 - **按需复权**：湖只存原始价 + 累计因子，前复权 / 后复权在查询时按 `AdjustMode`（raw / forward / backward）派生，锚点取查询区间首/末 bar，同区间结果可复现。
 - **增量更新**：`pulsar-data update` 以水位驱动日终增量，合并去重写入（不截断已有分区），重跑幂等；与回填共用同一条采集管线。
 - **数据质量**：canonical schema 校验、OHLC 不变式、去重、相对交易日历的完整性报告（区分 `ok / not_listed / coverage_end / suspended / gap`，`gap` 为未解释缺 bar）。
 - **质量标记与缺口闭环**：每行 bar 带 `quality` 标记列（`ok / backfilled / suspect`，未知取值被质量门拒绝）；交叉校验差异事件可落地为行级 `suspect` 标记（幂等、分区原子覆盖写）；`gap` 缺口自动转化为按分区的补数任务清单，整区覆盖重取写入（重复执行逐位一致、断点续跑）；分区级质量报告 + 查询层 `quality` 参数读侧过滤。
-- **回填 CLI**：`pulsar-data backfill` 支持全市场或指定标的的历史回填，支持 `--fixture-dir` 离线回放（CI 与无网环境）。
+- **回填 CLI**：`pulsar-data backfill` 支持全市场或指定标的的历史回填，支持 `--freq 5m/15m/30m/60m` 分钟族回填（按标的 × 日历年分块取数，`--all` 全市场入口可回落湖内 instruments 快照），支持 `--fixture-dir` 离线回放（CI 与无网环境）。
 - **出网安全**：所有 HTTP 请求仅允许 http/https，发起前校验目标 host，拒绝 localhost / 环回 / 私有 / 保留地址；提供公共校验函数与全局 requests 守卫钩子。
 
 ## 安装
@@ -75,6 +76,27 @@ pulsar-data verify --lake ./data/lake --start 2024-01-01 --end 2024-12-31
 ```
 
 退出码非 0 表示存在未解释缺 bar。
+
+### 分钟级历史回填（baostock，5/15/30/60 分钟）
+
+```bash
+# 指定域：20 只样本自 2020 年（上游分钟覆盖起点）至今的 5 分钟线
+pulsar-data backfill --source baostock --lake ./data/lake \
+    --start 2020-01-01 --end 2026-10-05 --freq 5m \
+    --symbols SH600519,SZ000001,... --report minute-report.json --fail-on-gaps
+
+# 全市场：--all 无上游清单时可回落到日线回填落好的 instruments 快照
+pulsar-data backfill --source baostock --lake ./data/lake \
+    --start 2020-01-01 --end 2026-10-05 --freq 5m --all
+
+# 完整性复核（每交易日须满 48/16/8/4 根，缺根即未解释 gap）
+pulsar-data verify --lake ./data/lake --start 2020-06-01 --end 2026-09-30 \
+    --symbols SH600519 --freq 5m
+```
+
+分钟回填按 `标的 × 日历年` 分块取数（单次响应有界、重试代价小、分区整写），水位与
+`quality=backfilled` 标记沿用既有机制；日域参考数据（instruments / 停牌 / 公司行为）
+不在分钟路径重复摄取，停牌记录仍用于解释缺失的分钟日。
 
 ### 日终增量更新（水位驱动，可重入）
 
@@ -191,9 +213,11 @@ from pulsar_data import LakeMarketDataPort, LakeQuery
 
 port = LakeMarketDataPort("./data/lake")
 
-# 1) 端口读侧：fetch_bars = DuckDB 查询 + 按需复权
+# 1) 端口读侧：fetch_bars = DuckDB 查询 + 按需复权（日线与分钟同签名）
 bars = port.fetch_bars(["SH600519"], date(2024, 1, 1), date(2024, 12, 31),
                        Freq.DAILY, AdjustMode.FORWARD)
+five = port.fetch_bars(["SH600519"], date(2024, 6, 3), date(2024, 6, 7),
+                       Freq.MINUTE_5, AdjustMode.RAW)
 instruments = port.list_instruments(date(2024, 6, 30))
 actions = port.fetch_corporate_actions("SH600519")
 trade_days = port.calendar(date(2024, 1, 1), date(2024, 12, 31))
@@ -201,11 +225,13 @@ trade_days = port.calendar(date(2024, 1, 1), date(2024, 12, 31))
 # 2) DuckDB 直查（探索分析）：视图按需注册，只接受 SELECT/WITH
 with LakeQuery("./data/lake") as query:
     frame = query.bars(["SH600519"], date(2024, 1, 1), date(2024, 12, 31))
+    minutes = query.bars(["SH600519"], freq=Freq.MINUTE_15)   # 缺族时自动从 5m 降采样
     custom = query.query("SELECT symbol, count(*) AS n FROM bars_1d GROUP BY symbol")
 ```
 
-读侧行为约定：请求区间内出现未解释缺 bar（既非上市前/覆盖期末，也非停牌）时抛
-`DataNotAvailable`，绝不静默返回部分数据；分钟线与实时订阅分别属于二期与实时链路任务，
+读侧行为约定：请求区间内出现未解释缺 bar（既非上市前/覆盖期末，也非停牌；分钟级还要求
+每个在覆盖内的交易日满时段——48/16/8/4 根）时抛 `DataNotAvailable`，绝不静默返回部分
+数据；`Freq.MINUTE`（1m）暂无数据源，请求即报配置错误；实时订阅属实时链路任务，
 当前显式 `NotImplementedError`。
 
 ## 数据湖布局
@@ -213,6 +239,10 @@ with LakeQuery("./data/lake") as query:
 ```text
 lake/
   bars_1d/symbol=SH600519/year=2024/part.parquet   # 日线，按标的+年分区
+  bars_5min/symbol=SH600519/year=2024/part.parquet  # 分钟族与日线同构分区
+  bars_15min/symbol=SH600519/year=2024/part.parquet
+  bars_30min/symbol=SH600519/year=2024/part.parquet
+  bars_60min/symbol=SH600519/year=2024/part.parquet
   corporate_actions/symbol=SH600519/part.parquet
   instruments/instruments.parquet
   calendar/calendar.parquet
@@ -221,10 +251,28 @@ lake/
   _meta/backfill_tasks.json                         # 补数任务断点状态（已完成任务 id）
 ```
 
-- `bars_1d` canonical 列：`symbol, ts, open, high, low, close, volume, amount, adjust_factor, quality`。
-- 只存原始价格与复权因子；前复权 / 后复权在查询时按 `AdjustMode` 派生（复权因子由
-  上游后复权价 / 原始价逐日推导，保证与源端复权口径一致）。
-- 时间戳统一 Asia/Shanghai；日线 `ts` 为该交易日 `00:00`（左闭右开区间起点）。
+- `bars_1d` 与分钟族 canonical 列一致：`symbol, ts, open, high, low, close, volume, amount, adjust_factor, quality`。
+- 只存原始价格与复权因子；前复权 / 后复权在查询时按 `AdjustMode` 派生（日线复权因子由
+  上游后复权价 / 原始价逐日推导；分钟族复权因子由 `query_adjust_factor` 全历史事件
+  as-of 合并——实测与日线口径逐位一致）。
+- 时间戳统一 Asia/Shanghai；日线 `ts` 为该交易日 `00:00`，分钟 bar `ts` 为区间左端点
+  （上游按区间**末**端标记，归一化时平移到左闭约定；首根 5 分钟 bar 为 `09:30`）。
+
+## 分钟级磁盘量级估算（实测外推）
+
+以真实录制数据经完整 `normalize → 质量门 → Parquet` 管线落盘实测（20 标的 × 跨年窗口，
+`tests/fixtures/baostock/manifest.json` 的 `disk_measure`）：
+
+| 实测项 | 数值 |
+|-|-|
+| 完整分区字节密度（816 行以上分区） | 33–50 B/row（中位 ≈ 42 B/row） |
+| 单标的单年 5 分钟行数（48 根 × 242 交易日） | 11,616 行 ≈ 0.38–0.58 MB |
+| 全市场单年（≈ 5,400 标的） | ≈ 2.1–3.2 GB/年（中位 ≈ 2.6 GB） |
+| `bars_5min` 全量（上游覆盖 2020-06 → 2026-09，约 6.3 年） | **≈ 13–20 GB**（中位 ≈ 17 GB） |
+| 加齐 15/30/60 分钟族（行数 ≈ 1/3、1/6、1/12） | 合计 ≈ 21–32 GB |
+
+预算结论：消费级笔记本磁盘可承载全市场四档分钟全历史；若只落 `bars_5min`
+（其余三档查询时按需降采样），全量约一二十 GB。
 - `quality` 取值 `ok / backfilled / suspect`（未知取值在质量门被拒）：常规增量与参考数据写入
   `ok`，历史回填与缺口补数写入 `backfilled`，交叉校验差异行落地 `suspect`；读侧经
   `LakeQuery.bars(quality=...)` 按标记过滤。
@@ -339,6 +387,9 @@ pytest
   （录制脚本 `scripts/record_fixtures.py`，manifest 记录来源与版本）；baostock 以
   Mock SDK（login/logout + ResultData 游标协议的假模块）与录制假客户端驱动，
   CI 不依赖外网。
+- 分钟级验收（fixture 驱动，`tests/fixtures/baostock/` 由 `scripts/record_minute_fixtures.py`
+  录制真实上游响应）：20 标的样本域 × 跨年窗口（2020-06 起，上游实测分钟覆盖起点）
+  5 分钟回填**零未解释缺口**；`fetch_bars` 各分钟档与湖内数据逐行一致；日线全量回归保持绿。
 - 出网安全、归一化、质量校验、湖写入原子性（并发读写竞争）/ 水位 / 增量幂等重入、
   复权核对（构造分红送转样本的手工算例 + 录制茅台真实分红样本与源端口径交叉验证）、
   20 标的 × 1 年完整回填均有独立测试。

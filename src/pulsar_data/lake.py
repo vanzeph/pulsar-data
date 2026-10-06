@@ -4,11 +4,20 @@ Layout (mirrors the integration design exactly)::
 
     lake/
       bars_1d/symbol=SH600519/year=2024/part.parquet
+      bars_5min/symbol=SH600519/year=2024/part.parquet
+      bars_15min/symbol=SH600519/year=2024/part.parquet
+      bars_30min/symbol=SH600519/year=2024/part.parquet
+      bars_60min/symbol=SH600519/year=2024/part.parquet
       corporate_actions/symbol=SH600519/part.parquet
       instruments/instruments.parquet
       calendar/calendar.parquet
       suspensions/symbol=SH600519/part.parquet
       _meta/watermarks.parquet
+
+Minute datasets partition exactly like ``bars_1d`` (symbol + calendar
+year of the bar timestamp) and share the whole write machinery:
+atomic ``.tmp`` + ``os.replace`` replacement, watermark bookkeeping and
+``quality`` marks all work unchanged.
 
 Write atomicity: every partition file is written to a ``.tmp-<uuid>``
 sibling first and moved into place with ``os.replace`` — a reader
@@ -32,7 +41,13 @@ from typing import Iterable
 import pandas as pd
 
 from .errors import LakeError
-from .schema import Dataset, ts_to_date
+from .schema import (
+    BAR_DATASETS,
+    DATASET_MINUTES,
+    TRADING_MINUTES_PER_DAY,
+    Dataset,
+    ts_to_date,
+)
 from .symbols import to_canonical_symbol
 
 __all__ = ["DataLake", "MERGE_KEYS"]
@@ -41,6 +56,10 @@ __all__ = ["DataLake", "MERGE_KEYS"]
 #: incoming rows win over stored rows with the same key.
 MERGE_KEYS: dict[Dataset, tuple[str, ...]] = {
     Dataset.BARS_1D: ("symbol", "ts"),
+    Dataset.BARS_5MIN: ("symbol", "ts"),
+    Dataset.BARS_15MIN: ("symbol", "ts"),
+    Dataset.BARS_30MIN: ("symbol", "ts"),
+    Dataset.BARS_60MIN: ("symbol", "ts"),
     Dataset.CORPORATE_ACTIONS: ("symbol", "ex_date"),
     Dataset.SUSPENSIONS: ("symbol", "start_date", "end_date"),
     Dataset.INSTRUMENTS: ("symbol",),
@@ -85,7 +104,7 @@ class DataLake:
         return Path(*parts) / "part.parquet"
 
     def _partition_keys(self, dataset: Dataset, frame: pd.DataFrame, row: pd.Series) -> dict[str, str]:
-        if dataset is Dataset.BARS_1D:
+        if dataset in BAR_DATASETS:
             year = ts_to_date(row["ts"]).year
             return {"symbol": row["symbol"], "year": str(year)}
         if dataset in (Dataset.CORPORATE_ACTIONS, Dataset.SUSPENSIONS):
@@ -405,3 +424,68 @@ class DataLake:
             for symbol, buckets in classified.items()
             if buckets["gap"]
         }
+
+    # ------------------------------------------------- minute completeness
+    def minute_completeness(
+        self,
+        *,
+        dataset: Dataset,
+        start: date,
+        end: date,
+        symbols: Iterable[str] | None = None,
+        suspension_days: dict[str, set[date]] | None = None,
+    ) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+        """Day-level completeness walk for one minute dataset.
+
+        Same taxonomy as :meth:`completeness` (``ok / not_listed /
+        coverage_end / suspended / gap``) evaluated per trading day, with
+        one extra rule a daily walk does not need: a day only counts
+        ``ok`` when it carries the full session bar count at the
+        dataset's granularity (48 @ 5min, 16 @ 15min, 8 @ 30min,
+        4 @ 60min); a partially filled day is an unexplained ``gap``.
+        Returns ``(counts, missing_bars)`` where ``missing_bars``
+        details ``{symbol: {day: n_missing_bars}}`` for gap days only.
+        """
+        if dataset not in DATASET_MINUTES:
+            raise LakeError(f"{dataset.value} is not a minute dataset")
+        expected = TRADING_MINUTES_PER_DAY // DATASET_MINUTES[dataset]
+        trading_days = self.calendar_dates(start, end)
+        if not trading_days:
+            raise LakeError(
+                f"no calendar rows in [{start}, {end}]; ingest the calendar dataset first"
+            )
+        bars = self.read(dataset, symbols=symbols)
+        if bars.empty:
+            return {}, {}
+        suspension_days = suspension_days or {}
+        counts: dict[str, dict[str, int]] = {}
+        missing: dict[str, dict[str, int]] = {}
+        bars = bars.copy()
+        bars["trade_date"] = pd.to_datetime(bars["ts"], utc=True).dt.tz_convert(
+            "Asia/Shanghai"
+        ).dt.date
+        per_day = bars.groupby(["symbol", "trade_date"]).size()
+        for symbol, group in bars.groupby("symbol"):
+            canonical = to_canonical_symbol(symbol)
+            present = set(group["trade_date"])
+            first, last = min(present), max(present)
+            suspended = suspension_days.get(canonical, set())
+            buckets: dict[str, list[date]] = {
+                category: [] for category in self.COMPLETENESS_CATEGORIES
+            }
+            for day in trading_days:
+                if day in suspended:
+                    buckets["suspended"].append(day)
+                elif day < first:
+                    buckets["not_listed"].append(day)
+                elif day > last:
+                    buckets["coverage_end"].append(day)
+                else:
+                    have = int(per_day.get((symbol, day), 0))
+                    if have >= expected:
+                        buckets["ok"].append(day)
+                    else:
+                        buckets["gap"].append(day)
+                        missing.setdefault(canonical, {})[day.isoformat()] = expected - have
+            counts[canonical] = {category: len(days) for category, days in buckets.items()}
+        return counts, missing

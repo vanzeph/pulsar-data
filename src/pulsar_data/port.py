@@ -5,7 +5,9 @@
 
 * ``fetch_bars`` = DuckDB query (:mod:`pulsar_data.query`) + query-time
   adjustment derivation (:mod:`pulsar_data.adjust`) — exactly the
-  composition the integration design prescribes;
+  composition the integration design prescribes — for daily **and**
+  minute frequencies (``5m/15m/30m/60m`` read their ``bars_<freq>``
+  families, downsampling from a finer stored family when needed);
 * ``list_instruments`` / ``fetch_corporate_actions`` / ``calendar`` map
   lake rows onto the immutable contract objects;
 * ``subscribe`` (realtime snapshots for Paper/Live) belongs to the D5
@@ -14,7 +16,9 @@
 Reads never mutate the lake and never return silently-truncated data:
 a requested window whose trading days are missing without explanation
 (before listing / after coverage / suspension are explained) raises
-:class:`~pulsar_data.errors.DataNotAvailable`.
+:class:`~pulsar_data.errors.DataNotAvailable`.  Minute reads apply the
+same rule one level finer: every in-coverage trading day must carry
+the full session bar count at the requested granularity.
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ from .backfill import suspension_days
 from .errors import DataNotAvailable
 from .lake import DataLake
 from .query import LakeQuery
-from .schema import BAR_COLUMNS
+from .schema import BAR_COLUMNS, TRADING_MINUTES_PER_DAY, freq_minutes
 from .symbols import to_canonical_symbol
 
 __all__ = ["LakeMarketDataPort"]
@@ -102,25 +106,25 @@ class LakeMarketDataPort:
         freq: Freq,
         adjust: AdjustMode,
     ) -> pd.DataFrame:
-        """Daily bars for ``symbols`` in ``[start, end]`` restated per ``adjust``.
+        """Bars for ``symbols`` in ``[start, end]`` at ``freq``, restated per ``adjust``.
 
-        Returns the canonical bar columns, one row per symbol and trading
-        day; inclusive on both ends.  Days missing without explanation
-        (listing window, suspension) raise instead of returning partial
-        data — see the module docstring.
+        Returns the canonical bar columns — one row per symbol and
+        trading day for ``1d``, per symbol and intraday interval for the
+        minute frequencies; inclusive on both ends.  In-range trading
+        days missing without explanation (listing window, suspension —
+        and for minute freqs, partially filled sessions) raise instead
+        of returning partial data.
         """
-        if freq is not Freq.DAILY:
-            raise NotImplementedError(
-                "minute bars (bars_1min) are a phase-2 lake dataset; "
-                "only Freq.DAILY is served today"
-            )
         if not symbols:
             return pd.DataFrame(columns=list(BAR_COLUMNS))
         if end < start:
             raise ValueError(f"fetch_bars window is inverted: [{start}, {end}]")
         wanted = [to_canonical_symbol(symbol) for symbol in symbols]
-        bars = self.query.bars(wanted, start, end)
-        self._assert_complete(wanted, start, end, bars)
+        bars = self.query.bars(wanted, start, end, freq=freq)
+        if freq is Freq.DAILY:
+            self._assert_complete(wanted, start, end, bars)
+        else:
+            self._assert_minute_complete(wanted, start, end, bars, freq)
         return derive_adjusted(bars, adjust)
 
     # ------------------------------------------------------------ reference
@@ -212,6 +216,67 @@ class LakeMarketDataPort:
         if problems:
             raise DataNotAvailable(
                 "requested bar range is incomplete in the lake; "
+                "refusing to return partial data — " + "; ".join(problems)
+            )
+
+    def _assert_minute_complete(
+        self,
+        symbols: Sequence[str],
+        start: date,
+        end: date,
+        bars: pd.DataFrame,
+        freq: Freq,
+    ) -> None:
+        """Minute counterpart of :meth:`_assert_complete`.
+
+        Every trading day inside a symbol's coverage window must carry
+        the full session bar count at ``freq``; suspended days and the
+        pre-listing / after-coverage ranges are explained absences, the
+        same taxonomy the daily check applies one level coarser.
+        """
+        trading_days = self.calendar(start, end)
+        if not trading_days:
+            return
+        if bars.empty:
+            raise DataNotAvailable(
+                f"no minute bars in lake for {list(symbols)} within [{start}, {end}]"
+            )
+        expected = TRADING_MINUTES_PER_DAY // freq_minutes(freq)
+        bars = bars.copy()
+        bars["trade_date"] = pd.to_datetime(bars["ts"], utc=True).dt.tz_convert(
+            "Asia/Shanghai"
+        ).dt.date
+        suspended = suspension_days(self.lake, symbols)
+        per_day: dict[str, dict[date, int]] = {
+            symbol: group.groupby("trade_date").size().to_dict()
+            for symbol, group in bars.groupby("symbol")
+        }
+        problems: list[str] = []
+        for symbol in symbols:
+            days = per_day.get(symbol)
+            if not days:
+                problems.append(f"{symbol}: no minute bars in lake within [{start}, {end}]")
+                continue
+            first, last = min(days), max(days)
+            excused = suspended.get(symbol, set())
+            short = [
+                (day, days.get(day, 0))
+                for day in trading_days
+                if not (day in excused or day < first or day > last)
+                and days.get(day, 0) < expected
+            ]
+            if short:
+                shown = ", ".join(
+                    f"{day.isoformat()}({expected - have} missing)" for day, have in short[:3]
+                )
+                more = "" if len(short) <= 3 else f" (+{len(short) - 3} more days)"
+                problems.append(
+                    f"{symbol}: {len(short)} incomplete/missing session day(s) at "
+                    f"{freq} [{shown}{more}]"
+                )
+        if problems:
+            raise DataNotAvailable(
+                "requested minute-bar range is incomplete in the lake; "
                 "refusing to return partial data — " + "; ".join(problems)
             )
 
