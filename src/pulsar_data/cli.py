@@ -1,4 +1,4 @@
-"""Command-line interface: ``pulsar-data backfill|verify|update|repair|quality|sources``.
+"""Command-line interface: ``pulsar-data backfill|verify|update|repair|quality|sources|snapshots``.
 
 The backfill command works in two modes:
 
@@ -26,6 +26,12 @@ trading day by its full session bar count. Minute sources: baostock.
 whole-partition overwrite writes that are idempotent and resumable.
 ``quality`` prints/writes the partition-level quality-mark summary
 (ok / backfilled / suspect).
+
+``snapshots`` is the snapshot-accumulation daemon family (快照流积累):
+``collect`` runs the realtime channel into the ``snapshots`` partition
+family, ``start``/``stop`` manage it detached, ``status`` reports
+watermarks/gaps/disk, and ``archive`` runs the retention pass (raw →
+downsampled ``snapshots_1m``).
 """
 
 from __future__ import annotations
@@ -168,6 +174,10 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--min-interval", type=float, default=0.6, help="min seconds between upstream calls")
 
     sub.add_parser("sources", help="list registered source adapters")
+
+    from .snapshots.cli import register_parser as _register_snapshots
+
+    _register_snapshots(sub)
     return parser
 
 
@@ -272,6 +282,12 @@ def cmd_sources(_: argparse.Namespace) -> int:
     for source_id in list_adapters():
         print(source_id)
     return 0
+
+
+def _cmd_snapshots(args: argparse.Namespace) -> int:
+    from .snapshots.cli import run as run_snapshots
+
+    return run_snapshots(args)
 
 
 def cmd_repair(args: argparse.Namespace) -> int:
@@ -403,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
         "repair": cmd_repair,
         "quality": cmd_quality,
         "sources": cmd_sources,
+        "snapshots": _cmd_snapshots,
     }
     try:
         return handlers[args.command](args)

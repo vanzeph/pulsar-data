@@ -22,6 +22,7 @@ Pulsar 数据集成包：可插拔数据源适配器框架、行情与参考数�
 - **数据质量**：canonical schema 校验、OHLC 不变式、去重、相对交易日历的完整性报告（区分 `ok / not_listed / coverage_end / suspended / gap`，`gap` 为未解释缺 bar）。
 - **质量标记与缺口闭环**：每行 bar 带 `quality` 标记列（`ok / backfilled / suspect`，未知取值被质量门拒绝）；交叉校验差异事件可落地为行级 `suspect` 标记（幂等、分区原子覆盖写）；`gap` 缺口自动转化为按分区的补数任务清单，整区覆盖重取写入（重复执行逐位一致、断点续跑）；分区级质量报告 + 查询层 `quality` 参数读侧过滤。
 - **回填 CLI**：`pulsar-data backfill` 支持全市场或指定标的的历史回填，支持 `--freq 5m/15m/30m/60m` 分钟族回填（按标的 × 日历年分块取数，`--all` 全市场入口可回落湖内 instruments 快照），支持 `--fixture-dir` 离线回放（CI 与无网环境）。
+- **快照流积累守护**（`pulsar-data snapshots`）：守护进程复用 D5 实时订阅通路（新浪主源 + 东财备源、主备降级、出网守卫、序号 / 迟到 / 缺失标记语义原样消费）把实时快照长期积累进数据湖新增 `snapshots` 分区族（**标的 × 日**分区、每订阅周期恰好一行、原子合并写与水位）；策略全可配（标的域默认自选清单、全市场约 1GB/日 需显式确认、采样频率上限、原始保留期限、到期降采样归档如 3s→1m）；断线重启自动续水位并把停机区间记入缺口台账（绝不静默丢帧）；磁盘水位监控与告警阈值；保留 / 归档任务幂等可重入。
 - **出网安全**：所有 HTTP 请求仅允许 http/https，发起前校验目标 host，拒绝 localhost / 环回 / 私有 / 保留地址；提供公共校验函数与全局 requests 守卫钩子。
 
 ## 安装
@@ -247,7 +248,13 @@ lake/
   instruments/instruments.parquet
   calendar/calendar.parquet
   suspensions/symbol=SH600519/part.parquet
+  snapshots/symbol=SH600519/date=2026-10-05/part.parquet   # 实时快照，按标的+日分区
+  snapshots_1m/symbol=SH600519/date=2026-09-01/part.parquet # 快照到期降采样归档（如 3s→1m）
   _meta/watermarks.parquet                          # 每源每分区更新水位
+  _meta/snapshot_state.json                         # 快照守护持久水位（按标的 last seq/ts）
+  _meta/snapshot_gaps.jsonl                         # 快照停机缺口台账（断线重连记缺口）
+  _meta/snapshot_alerts.jsonl                       # 磁盘水位告警记录
+  _meta/snapshot_policy.json                        # 守护运行时策略快照（status/archive 复用）
   _meta/backfill_tasks.json                         # 补数任务断点状态（已完成任务 id）
 ```
 
@@ -352,6 +359,89 @@ subscription = service.subscribe_events(["SH600519"], on_event=lambda e: print(e
 PULSAR_RUN_NETWORK_TESTS=1 pytest tests/network -m network
 ```
 
+## 快照流积累守护（本地先行）
+
+`pulsar_data.snapshots` 把上面的实时通路变成长期数据资产：一个守护进程订阅
+D5 通道（只消费、不改其语义），把**每个订阅周期的每个标的**持续写入数据湖
+`snapshots` 分区族（标的 × 日分区），并配套保留 / 降采样归档、缺口台账与磁盘
+水位监控。初期全部落本地磁盘，零云端依赖。
+
+### 启停与状态
+
+```bash
+# 前台跑一把（自选清单，Ctrl-C / SIGTERM 优雅退出并落最后一次刷盘）
+pulsar-data snapshots collect --lake ./data/lake --symbols SH600519,SZ000001
+
+# 守护方式：detached 启动（pidfile 于 <lake>/_meta/collect.pid，日志于 _meta/collect.log）
+pulsar-data snapshots start --lake ./data/lake --config ./snapshot-policy.json
+pulsar-data snapshots status --lake ./data/lake    # 运行状态 + 水位 + 缺口 + 磁盘报告
+pulsar-data snapshots stop  --lake ./data/lake
+
+# 保留 / 降采样归档（幂等，可交给 crontab 每日跑一次）
+pulsar-data snapshots archive --lake ./data/lake
+```
+
+pulsar-app 或 systemd 直接托管 `snapshots collect` 前台进程即可（SIGTERM 优雅停机）；
+`start/stop` 是轻量的 detached 封装，适合手工运维。
+
+### 策略配置（JSON）
+
+```json
+{
+  "symbols": ["SH600519", "SZ000001"],
+  "full_market": false,
+  "acknowledge_full_market": false,
+  "poll_interval_s": 3,
+  "min_sample_interval_s": 0,
+  "flush_interval_s": 5,
+  "raw_retention_days": 14,
+  "archive_interval_s": 60,
+  "reconnect_gap_threshold_s": 10,
+  "disk_warn_free_percent": 10,
+  "disk_warn_used_bytes": null
+}
+```
+
+- **标的域**：默认自选清单（`symbols`）。全市场（`"full_market": true`，标的取湖内
+  instruments 快照）约 **1GB/日**，必须同时显式 `"acknowledge_full_market": true`
+  （CLI `--all --accept-full-market`），否则加载即报配置错误——磁盘预算绝不静默默认。
+- **采样频率上限**（`min_sample_interval_s`）：每标的至多每 N 秒落一条行情；被抽稀的
+  周期落 `kind=thinned` 标记行（占位不占数据），缺口语义不受影响。
+- **保留与归档**：`raw_retention_days` 天前的原始分区聚合为 `snapshots_1m`
+  （`archive_interval_s`，默认 3s→1m：OHLC 取报价 `last_price` 首/高/低/末、量额取
+  累计值跨度、附 samples/missing/thinned 计数），归档落盘后才删除原始目录；
+  `archive_retention_days`（默认 0 = 永久）再控制归档本身的清理。
+- **断线与缺口**：守护重启时读取 `_meta/snapshot_state.json` 的持久水位续采；同一交易日
+  内超过 `reconnect_gap_threshold_s` 的停机写入 `_meta/snapshot_gaps.jsonl` 台账
+  （免费源无快照回填能力，区间如实记录而非谎称完整）。周期级缺失以 `kind=missing`
+  行落盘、迟到以 `kind=late` 落盘——**每个周期恰好一行，绝不静默丢帧**。
+- **磁盘水位**：每次刷盘检查快照族字节数与所在卷剩余空间，越过阈值写
+  `_meta/snapshot_alerts.jsonl` 并在 `status` 标红。
+
+### 磁盘预算（估算）
+
+单条快照行约 25 列（五档簿展开）：全市场约 5,400 标的 × 4 小时 / 3s ≈ 2,600 万行/日，
+约 **0.8–1.2 GB/日**（与设计预算 ~1GB/日 一致）；20 标的自选清单约 **4–5 MB/日**。
+归档后 1 分钟行数仅为原始的约 1/20（3s 档），长期保留成本可忽略。默认策略
+（自选 + 14 天原始保留）总占用约 `标的数 × 70 MB` 量级；全市场 14 天原始保留约
+**14–17 GB**，请按 `disk_warn_used_bytes` 设告警并配短保留期或低采样档。
+
+### 库用法
+
+```python
+from pulsar_data.lake import DataLake
+from pulsar_data.snapshots import SnapshotCollectorDaemon, SnapshotPolicy, archive_expired
+
+lake = DataLake("./data/lake")
+policy = SnapshotPolicy.from_mapping({"symbols": ["SH600519"], "raw_retention_days": 14})
+daemon = SnapshotCollectorDaemon(lake, policy)   # 真实源：新浪主源 + 东财备源
+daemon.start()
+...
+daemon.stop()                                    # 优雅停机：末次刷盘 + 水位落盘
+
+archive_expired(lake, policy)                    # 保留/降采样归档任务（幂等）
+```
+
 ## 适配器扩展
 
 新增数据源 = 新增一个适配器 + 一条注册，核心框架零改动：
@@ -395,6 +485,12 @@ pytest
   20 标的 × 1 年完整回填均有独立测试。
 - 主备路由：主源故障注入 → 自动降级 baostock → 完成当日增量的全流程演练、
   熔断 / 冷却半开 / 降级事件留痕、双源交叉校验（一致通过 / 超阈差异报告）均有独立测试。
+- 快照流积累：模拟快照流端到端（守护写入 → 重启续采 → 水位补齐 → 停机缺口台账 +
+  周期级 missing/late 标记落盘、每周期恰好一行）、采样抽稀（`thinned` 占位不破坏
+  `seq` 连续语义）、刷盘失败缓冲保留（绝不静默丢帧）、保留 / 降采样归档（到期聚合、
+  原始回收、重跑幂等、聚合失败保原始）、全市场开关守卫（未显式确认即拒绝）、
+  CLI 启停 / 状态 / 归档 / 真实子进程 SIGTERM 停机均有离线测试；
+  `tests/network/` 另有可选实网冒烟（默认跳过）。
 
 ## License
 

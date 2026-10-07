@@ -8,6 +8,8 @@ Layout (mirrors the integration design exactly)::
       bars_15min/symbol=SH600519/year=2024/part.parquet
       bars_30min/symbol=SH600519/year=2024/part.parquet
       bars_60min/symbol=SH600519/year=2024/part.parquet
+      snapshots/symbol=SH600519/date=2026-10-05/part.parquet
+      snapshots_1m/symbol=SH600519/date=2026-10-05/part.parquet
       corporate_actions/symbol=SH600519/part.parquet
       instruments/instruments.parquet
       calendar/calendar.parquet
@@ -44,6 +46,7 @@ from .errors import LakeError
 from .schema import (
     BAR_DATASETS,
     DATASET_MINUTES,
+    SNAPSHOT_DATASETS,
     TRADING_MINUTES_PER_DAY,
     Dataset,
     ts_to_date,
@@ -64,6 +67,9 @@ MERGE_KEYS: dict[Dataset, tuple[str, ...]] = {
     Dataset.SUSPENSIONS: ("symbol", "start_date", "end_date"),
     Dataset.INSTRUMENTS: ("symbol",),
     Dataset.CALENDAR: ("trade_date",),
+    # seq is per dispatcher session, so the session id belongs to the key.
+    Dataset.SNAPSHOTS: ("symbol", "session", "seq"),
+    Dataset.SNAPSHOTS_1M: ("symbol", "ts"),
 }
 
 
@@ -92,6 +98,18 @@ class DataLake:
             return self._locks.setdefault(key, threading.Lock())
 
     # ------------------------------------------------------------------ paths
+    @staticmethod
+    def _ordered_keys(keys: dict[str, str]) -> dict[str, str]:
+        """Canonical on-disk order of partition components: ``symbol`` first.
+
+        Keeps hive paths stable (``symbol=…/year=…``, ``symbol=…/date=…``)
+        regardless of the grouping order ``_split_partitions`` used.
+        """
+        if "symbol" in keys:
+            rest = {key: value for key, value in keys.items() if key != "symbol"}
+            return {"symbol": keys["symbol"], **rest}
+        return keys
+
     def partition_path(self, dataset: Dataset, keys: dict[str, str]) -> Path:
         """Path of the (single-file) partition for ``keys``.
 
@@ -99,7 +117,7 @@ class DataLake:
         ``{"symbol": "SH600519", "year": "2024"}``.
         """
         parts = [self.root, dataset.value]
-        for key, value in keys.items():
+        for key, value in self._ordered_keys(keys).items():
             parts.append(f"{key}={value}")
         return Path(*parts) / "part.parquet"
 
@@ -107,6 +125,9 @@ class DataLake:
         if dataset in BAR_DATASETS:
             year = ts_to_date(row["ts"]).year
             return {"symbol": row["symbol"], "year": str(year)}
+        if dataset in SNAPSHOT_DATASETS:
+            # 标的 × 日分区（快照流积累）：date is the trade date of the ts.
+            return {"symbol": row["symbol"], "date": ts_to_date(row["ts"]).isoformat()}
         if dataset in (Dataset.CORPORATE_ACTIONS, Dataset.SUSPENSIONS):
             return {"symbol": row["symbol"]}
         return {}
@@ -167,7 +188,11 @@ class DataLake:
             merged = pd.concat([existing, incoming], ignore_index=True)
         merged = merged.drop_duplicates(subset=list(key), keep="last", ignore_index=True)
         if "ts" in merged.columns:
-            sort_keys = [column for column in ("symbol", "ts", "ex_date", "trade_date") if column in merged.columns]
+            sort_keys = [
+                column
+                for column in ("symbol", "ts", "seq", "ex_date", "trade_date")
+                if column in merged.columns
+            ]
             merged = merged.sort_values(sort_keys, kind="stable").reset_index(drop=True)
         elif "trade_date" in merged.columns:
             merged = merged.sort_values(["trade_date"], kind="stable").reset_index(drop=True)
@@ -199,7 +224,7 @@ class DataLake:
         tmp = target.with_name(f".tmp-{uuid.uuid4().hex}.parquet")
         frame.to_parquet(tmp, index=False, engine="pyarrow")
         os.replace(tmp, target)
-        relative = "/".join(f"{k}={v}" for k, v in keys.items())
+        relative = "/".join(f"{k}={v}" for k, v in self._ordered_keys(keys).items())
         return relative
 
     # ------------------------------------------------------------------ read

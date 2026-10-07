@@ -33,10 +33,14 @@ __all__ = [
     "CORPORATE_ACTION_COLUMNS",
     "INSTRUMENT_COLUMNS",
     "SUSPENSION_COLUMNS",
+    "SNAPSHOT_COLUMNS",
+    "SNAPSHOT_1M_COLUMNS",
+    "SNAPSHOT_KIND_VALUES",
     "WATERMARK_COLUMNS",
     "QUALITY_VALUES",
     "BAR_DATASETS",
     "MINUTE_DATASETS",
+    "SNAPSHOT_DATASETS",
     "dataset_for_freq",
     "freq_minutes",
     "bars_per_trading_day",
@@ -88,6 +92,63 @@ SUSPENSION_COLUMNS: Final[tuple[str, ...]] = (
     "end_date",
     "reason",
 )
+
+
+def _book_columns() -> tuple[str, ...]:
+    """Flatten the five-level book into price/volume columns, bid side first."""
+    columns: list[str] = []
+    for side in ("bid", "ask"):
+        for level in range(1, 6):
+            columns.append(f"{side}{level}_price")
+            columns.append(f"{side}{level}_volume")
+    return tuple(columns)
+
+
+#: Canonical column set of one persisted realtime-snapshot cycle row
+#: (dataset ``snapshots``): every poll cycle of every subscribed symbol lands
+#: exactly one row — delivered quotes with data, and marker rows (``missing``
+#: for cycles without a usable quote, ``thinned`` for quotes dropped by the
+#: sampling-cap policy) so gaps stay visible in ``seq`` space; gaps in the
+#: persisted ``seq`` sequence itself therefore never happen.
+SNAPSHOT_COLUMNS: Final[tuple[str, ...]] = (
+    "symbol",
+    "ts",
+    "seq",
+    "kind",
+    "source",
+    "session",
+    "last_price",
+    "volume",
+    "amount",
+) + _book_columns()
+
+#: Canonical column set of one downsampled archive row (dataset
+#: ``snapshots_1m``): per symbol and aggregation interval, OHLC over the
+#: quote ``last_price``, volume/amount as spans of the cumulative day
+#: totals (max − min), plus the marker counts that keep gaps visible after
+#: the raw partition is reclaimed.
+SNAPSHOT_1M_COLUMNS: Final[tuple[str, ...]] = (
+    "symbol",
+    "ts",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "samples",
+    "missing",
+    "thinned",
+    "quality",
+)
+
+#: Allowed values of the per-row ``kind`` marker column.
+#: ``snapshot`` — an on-time quote; ``late`` — an out-of-order quote,
+#: delivered and flagged (same semantics as the realtime channel);
+#: ``missing`` — a cycle without a usable quote (the row *is* the marker);
+#: ``thinned`` — a usable quote skipped by the configured sampling cap.
+SNAPSHOT_KIND_VALUES: Final[tuple[str, ...]] = ("snapshot", "late", "missing", "thinned")
+
 WATERMARK_COLUMNS: Final[tuple[str, ...]] = (
     "source",
     "dataset",
@@ -116,6 +177,8 @@ class Dataset(str, enum.Enum):
     CORPORATE_ACTIONS = "corporate_actions"
     INSTRUMENTS = "instruments"
     SUSPENSIONS = "suspensions"
+    SNAPSHOTS = "snapshots"
+    SNAPSHOTS_1M = "snapshots_1m"
 
 
 #: Every dataset carrying the canonical bar column set.
@@ -135,6 +198,14 @@ MINUTE_DATASETS: Final[tuple[Dataset, ...]] = (
     Dataset.BARS_15MIN,
     Dataset.BARS_30MIN,
     Dataset.BARS_60MIN,
+)
+
+#: The realtime-snapshot partition families (raw cycles and the downsampled
+#: archive).  Both partition by ``symbol × trade date of ts`` and are written
+#: only by the snapshot collect daemon / archive task — never by the bar
+#: ingestion pipeline.
+SNAPSHOT_DATASETS: Final[frozenset[Dataset]] = frozenset(
+    {Dataset.SNAPSHOTS, Dataset.SNAPSHOTS_1M}
 )
 
 #: Contract frequency -> lake dataset (one partition family per granularity).
